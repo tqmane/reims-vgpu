@@ -201,9 +201,10 @@ fn check_mip_extent(
     Some(mip_end)
 }
 
-/// Whether a texture's data fits its allocation, counting the last mip's final row as the bytes
-/// its width needs (`real_slice_end`), not a full `bytes_per_row` stride. The slices before the
-/// last are a full `bytes_per_slice` apart; only the last slice's trailing stride is unused.
+/// Whether a texture's data fits its allocation, counting each mip's final row as the bytes its
+/// width needs, not a full `bytes_per_row` stride: `real_slice_end` is the furthest any mip's
+/// data reaches in a slice. The slices before the last are a full `bytes_per_slice` apart; only
+/// the last slice's trailing stride is unused.
 ///
 /// Apple's framework counts every row's full stride (base plus slices times `bytes_per_slice`),
 /// so it refuses a strided, buffer-backed texture whose last row ends within a stride of the
@@ -431,11 +432,14 @@ pub fn validate_texture_dimension<P: Platform, const N: usize>(
                     ) else {
                         return false;
                     };
-                    // The mip's data ends its last row at its width, not a full stride.
-                    real_slice_end = m
-                        .offset
-                        .wrapping_add(total_rows.saturating_sub(1).wrapping_mul(bytes_per_row))
-                        .wrapping_add(row_length);
+                    // The mip's data ends its last row at its width, not a full stride. Mips
+                    // may overlap, and a later one's padded rows can end before an earlier
+                    // one's data, so the furthest end counts, not the last mip's.
+                    real_slice_end = real_slice_end.max(
+                        m.offset
+                            .wrapping_add(total_rows.saturating_sub(1).wrapping_mul(bytes_per_row))
+                            .wrapping_add(row_length),
+                    );
                     // Each halving clamps to 1.
                     width = halve(width);
                     height = halve(height);
@@ -527,11 +531,14 @@ pub fn validate_texture_dimension<P: Platform, const N: usize>(
                     ) else {
                         return false;
                     };
-                    // The mip's data ends its last row of blocks at its width, not a full stride.
-                    real_slice_end = m
-                        .offset
-                        .wrapping_add(total_rows.saturating_sub(1).wrapping_mul(bytes_per_row))
-                        .wrapping_add(row_length);
+                    // The mip's data ends its last row of blocks at its width, not a full stride. Mips
+                    // may overlap, and a later one's padded rows can end before an earlier
+                    // one's data, so the furthest end counts, not the last mip's.
+                    real_slice_end = real_slice_end.max(
+                        m.offset
+                            .wrapping_add(total_rows.saturating_sub(1).wrapping_mul(bytes_per_row))
+                            .wrapping_add(row_length),
+                    );
                     // Each halving clamps to 1.
                     width = halve(width);
                     height = halve(height);
@@ -871,8 +878,8 @@ mod tests {
             );
         }
 
-        /// The span `baseOffset + bytesPerSlice * sliceCount` must end within the allocation;
-        /// equality passes.
+        /// The data, the slices before the last at full `bytesPerSlice` strides and the last
+        /// slice to its last mip's final pixel, must end within the allocation; equality passes.
         #[test]
         fn larger_than_allocation() {
             let p = plat();
@@ -886,6 +893,27 @@ mod tests {
             assert_eq!(
                 o.lines,
                 refused("its data ends at 0x2b0, past the allocation's 0x2af bytes")
+            );
+        }
+
+        /// A later mip overlapping an earlier one, whose padded row ends before the earlier
+        /// mip's data, does not shorten the data: mip 0's 0x10 bytes bound it, not mip 1's
+        /// 8 at offset 0.
+        #[test]
+        fn overlapping_mip_ends_before_an_earlier_one() {
+            let p = plat();
+            let t = tex(&p, desc(4, 1, 1, 2));
+            let r = rec(
+                0x20,
+                4,
+                vec![mip(0, 0x10, 0x10, 4, 1, 1), mip(0, 0x20, 0x20, 2, 1, 1)],
+            );
+            assert!(run1(&r, 2, false, 0x10, &t, &feats()).ok);
+            let o = run1(&r, 2, false, 0xf, &t, &feats());
+            assert!(!o.ok);
+            assert_eq!(
+                o.lines,
+                refused("its data ends at 0x10, past the allocation's 0xf bytes")
             );
         }
 
