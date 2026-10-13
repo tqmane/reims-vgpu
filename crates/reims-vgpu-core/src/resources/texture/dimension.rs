@@ -201,6 +201,41 @@ fn check_mip_extent(
     Some(mip_end)
 }
 
+/// Whether a texture's data fits its allocation, counting the last mip's final row as the bytes
+/// its width needs (`real_slice_end`), not a full `bytes_per_row` stride. The slices before the
+/// last are a full `bytes_per_slice` apart; only the last slice's trailing stride is unused.
+///
+/// Apple's framework counts every row's full stride (base plus slices times `bytes_per_slice`),
+/// so it refuses a strided, buffer-backed texture whose last row ends within a stride of the
+/// buffer's end. The bytes the texture reads are all there — its last row never reads past its
+/// own width — so this accepts it, keeping SkyLight's zero-copy window tiles (a window wider
+/// than two tiles would otherwise lose WindowServer; see docs/qemu.md).
+fn slice_footprint_fits(
+    base_offset: u64,
+    slice_count: u32,
+    bytes_per_slice: u64,
+    real_slice_end: u64,
+    allocation: u64,
+) -> bool {
+    // A zero slice size bounds nothing, as in [`check_mip_extent`] and Apple's own check (its
+    // `base plus slices times zero` is the base alone): the mip extent does not bound it.
+    let footprint = if bytes_per_slice == 0 {
+        base_offset
+    } else {
+        base_offset
+            .wrapping_add(u64::from(slice_count.saturating_sub(1)).wrapping_mul(bytes_per_slice))
+            .wrapping_add(real_slice_end)
+    };
+    if footprint > allocation {
+        log::warn!(
+            "texture dimension refused: its data ends at {footprint:#x}, past the allocation's \
+             {allocation:#x} bytes"
+        );
+        return false;
+    }
+    true
+}
+
 /// Logs a mip whose size is not the one its predecessors' halvings give (`want`: width, height,
 /// depth).
 fn log_mip_size_mismatch(mip: u32, m: &TextureMipDimension, want: [u64; 3]) {
@@ -269,8 +304,7 @@ pub fn validate_texture_dimension<P: Platform, const N: usize>(
             (if pd.is_cube() { 6_u32 } else { 1 }).wrapping_mul(u32::from(array_length));
         // The allocation span is computed into a `u32`, so a span over 4 GiB - 1 is refused as
         // an overflow.
-        let (calculated, overflow) =
-            mul_add_overflow_u32(bytes_per_slice, slice_count, base_offset);
+        let (_, overflow) = mul_add_overflow_u32(bytes_per_slice, slice_count, base_offset);
         if overflow {
             log::warn!(
                 "texture dimension refused: base {base_offset:#x} plus {slice_count} x \
@@ -278,13 +312,8 @@ pub fn validate_texture_dimension<P: Platform, const N: usize>(
             );
             return false;
         }
-        if u64::from(calculated) > texture_allocation_length {
-            log::warn!(
-                "texture dimension refused: its slices end at {calculated:#x}, past the \
-                 allocation's {texture_allocation_length:#x} bytes"
-            );
-            return false;
-        }
+        // Whether the data fits the allocation is checked per kind below, from the last mip's
+        // real extent (`slice_footprint_fits`), not the last row's full stride.
         // 64 bits against the u16.
         if texture.array_length() != u64::from(array_length) {
             // Asked a second time, for the line, whether or not the line is written.
@@ -361,6 +390,7 @@ pub fn validate_texture_dimension<P: Platform, const N: usize>(
                 let bytes_per_pixel =
                     u32::from(bytes_per_block).wrapping_mul(sample_count.low_u32());
                 let mut last_mip_end = 0u64;
+                let mut real_slice_end = 0u64;
                 for mip in 0..mip_levels {
                     let m = src_mip(src, mip);
                     dst.mips.push(m);
@@ -401,11 +431,25 @@ pub fn validate_texture_dimension<P: Platform, const N: usize>(
                     ) else {
                         return false;
                     };
+                    // The mip's data ends its last row at its width, not a full stride.
+                    real_slice_end = m
+                        .offset
+                        .wrapping_add(total_rows.saturating_sub(1).wrapping_mul(bytes_per_row))
+                        .wrapping_add(row_length);
                     // Each halving clamps to 1.
                     width = halve(width);
                     height = halve(height);
                     depth = halve(depth);
                     last_mip_end = mip_end;
+                }
+                if !slice_footprint_fits(
+                    base_offset,
+                    slice_count,
+                    bytes_per_slice,
+                    real_slice_end,
+                    texture_allocation_length,
+                ) {
+                    return false;
                 }
             }
             KIND_COMPRESSED => {
@@ -442,6 +486,7 @@ pub fn validate_texture_dimension<P: Platform, const N: usize>(
                     return false;
                 }
                 let mut last_mip_end = 0u64;
+                let mut real_slice_end = 0u64;
                 for mip in 0..mip_levels {
                     let m = src_mip(src, mip);
                     dst.mips.push(m);
@@ -482,11 +527,25 @@ pub fn validate_texture_dimension<P: Platform, const N: usize>(
                     ) else {
                         return false;
                     };
+                    // The mip's data ends its last row of blocks at its width, not a full stride.
+                    real_slice_end = m
+                        .offset
+                        .wrapping_add(total_rows.saturating_sub(1).wrapping_mul(bytes_per_row))
+                        .wrapping_add(row_length);
                     // Each halving clamps to 1.
                     width = halve(width);
                     height = halve(height);
                     depth = halve(depth);
                     last_mip_end = mip_end;
+                }
+                if !slice_footprint_fits(
+                    base_offset,
+                    slice_count,
+                    bytes_per_slice,
+                    real_slice_end,
+                    texture_allocation_length,
+                ) {
+                    return false;
                 }
             }
             // The kinds are 0, 1 and 2 (pixel_format.rs).
@@ -793,14 +852,22 @@ mod tests {
             let o = run1(&r, 1, false, u64::MAX, &t, &feats());
             assert!(!o.ok);
             assert!(o.lines[0].contains(" plus 6 x "));
+            // A cube's six faces are counted: five full strides plus the last face's data.
+            let c = tex(
+                &p,
+                TexDesc {
+                    texture_type: TEXTURE_TYPE_CUBE,
+                    ..desc(1, 1, 1, 1)
+                },
+            );
             let mut r = rec(0x10, 4, vec![mip(0, 4, 4, 1, 1, 1)]);
             r.header.bits |= IS_CUBE;
-            r.header.array_length = 0xffff;
-            let o = run1(&r, 1, false, 0, &t, &feats());
+            assert!(run1(&r, 1, false, 0x54, &c, &feats()).ok);
+            let o = run1(&r, 1, false, 0x53, &c, &feats());
             assert!(!o.ok);
             assert_eq!(
                 o.lines,
-                refused("its slices end at 0x5fffa0, past the allocation's 0x0 bytes")
+                refused("its data ends at 0x54, past the allocation's 0x53 bytes")
             );
         }
 
@@ -812,12 +879,13 @@ mod tests {
             let (d, mut r) = good16x8();
             r.header.base_offset = 0x10;
             let t = tex(&p, d);
-            assert!(run1(&r, 3, false, 0x310, &t, &feats()).ok);
-            let o = run1(&r, 3, false, 0x30f, &t, &feats());
+            // The data ends at base 0x10 plus the last mip's end 0x2a0, not the declared slice.
+            assert!(run1(&r, 3, false, 0x2b0, &t, &feats()).ok);
+            let o = run1(&r, 3, false, 0x2af, &t, &feats());
             assert!(!o.ok);
             assert_eq!(
                 o.lines,
-                refused("its slices end at 0x310, past the allocation's 0x30f bytes")
+                refused("its data ends at 0x2b0, past the allocation's 0x2af bytes")
             );
         }
 
