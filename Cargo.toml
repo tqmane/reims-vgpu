@@ -28,9 +28,9 @@ reims-vgpu = { path = "crates/reims-vgpu", default-features = false }
 reims-vgpu-vulkan = { path = "crates/reims-vgpu-vulkan" }
 # The Vulkan platform's proof of concept (architecture D1): a Metal-shaped API on Vulkan, from
 # metal2vulkan's public repository at the commit both name.
-metal2vulkan-runtime = { git = "https://github.com/tqmane/metal2vulkan", rev = "8556e6e4fe54fd8edcf45d48415242a2ac875421" }
+metal2vulkan-runtime = { git = "https://github.com/tqmane/metal2vulkan", rev = "d41a1c2fb6aad7ef52bc9e0c8be8957b3e71c935" }
 # Its translator, for the Metal enums and descriptor values the runtime's calls take.
-metal2vulkan = { git = "https://github.com/tqmane/metal2vulkan", rev = "8556e6e4fe54fd8edcf45d48415242a2ac875421" }
+metal2vulkan = { git = "https://github.com/tqmane/metal2vulkan", rev = "d41a1c2fb6aad7ef52bc9e0c8be8957b3e71c935" }
 # The hashes of the Vulkan platform's metallib sources (reims-vgpu-vulkan/build.rs).
 sha2 = "0.10.9"
 # A display window's swapchain on Linux (reims-vgpu-vulkan/src/swapchain.rs), at the runtime's

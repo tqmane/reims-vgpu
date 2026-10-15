@@ -17,6 +17,21 @@ pub use clock::WindowsClock;
 pub(crate) use import::{TWINS_READ_ONLY, allocate_zeros, import_view, shown_at};
 pub use threads::WindowsThreads;
 pub(crate) use vm::OwnMemory;
+
+/// Host pages imported through Windows' validated pointer path, without dma-bufs.
+///
+/// # Safety
+///
+/// The pointer meets `rt::HostMemory::new`'s lifetime and accessibility contract.
+pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>) -> rt::HostMemory {
+    // SAFETY: the caller keeps the checked Windows view alive for the import.
+    unsafe { rt::HostMemory::new(at) }
+}
+
+/// Windows imports no dma-buf source, so it has no dma-buf refusal.
+pub(crate) fn dma_buf_refusal() -> Option<String> {
+    None
+}
 pub use vm::WindowsVm;
 #[cfg(test)]
 pub(crate) use vm::allocate_aliasable;

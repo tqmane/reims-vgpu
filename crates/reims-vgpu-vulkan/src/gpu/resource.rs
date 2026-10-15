@@ -1378,7 +1378,13 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
                     // writes, whose writes this host's GPU drops (`backing`'s docs), and any
                     // other is writable. It stays mapped, with the same pages, until its
                     // keep-alive is dropped, as nothing else frees or remaps it.
-                    unsafe { self.raw.rebind_bytes_no_copy(first, None, Some(keep)) }
+                    unsafe {
+                        (self.raw).rebind_bytes_no_copy(
+                            crate::os::host_memory(first),
+                            None,
+                            Some(keep),
+                        )
+                    }
                 })
             })
     }
@@ -2138,7 +2144,13 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 send(REPLACE, Policy::Dies, || {
                     // SAFETY: as a buffer's, for the heap's size; the alias starts on a page,
                     // which is the runtime's import unit on this host.
-                    unsafe { self.raw.rebind_bytes_no_copy(first, None, Some(keep)) }
+                    unsafe {
+                        (self.raw).rebind_bytes_no_copy(
+                            crate::os::host_memory(first),
+                            None,
+                            Some(keep),
+                        )
+                    }
                 })
             },
         )

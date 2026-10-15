@@ -22,9 +22,9 @@ and runs macOS VMs for you.
 
 ## Getting started
 
-You bring your own macOS; we don't ship disk images. On an Apple silicon Mac, that's an IPSW, or a
-VM you already made with macosvm or tart. On Linux, it's an OpenCore image with a macOS installer,
-or a disk that already has macOS on it.
+We don't ship disk images: macOS comes straight from Apple. On an Apple silicon Mac, that's an
+IPSW, or a VM you already made with macosvm or tart. On Linux, `reims-ctl` downloads the installer
+from Apple and sets the VM up for you, or uses a disk that already has macOS on it.
 
 We've tested arm64 macOS 13, 14, 15 and 26 on an M3 Max, and x86-64 macOS 26 on Linux with an RTX
 5080 laptop GPU. [docs/qemu.md](docs/qemu.md) has the details.
@@ -60,7 +60,8 @@ scripts/install-ctl.sh
 
 It installs what the build needs (Homebrew on macOS; apt on Ubuntu and Debian, pacman on Arch and
 CachyOS; Rust through rustup.rs), fetches `vendor/qemu`, builds the library and QEMU on it, installs
-QEMU into `~/.local/share/reims-ctl/qemu`, and `reims-ctl` into `~/.cargo/bin`. `vendor/qemu` is
+QEMU into `~/.local/share/reims-ctl/qemu`, and `reims-ctl` into `~/.cargo/bin`, with
+[reims-util](https://github.com/steelbrain/reims-util) beside it on Linux. `vendor/qemu` is
 fetched from its public repository (`steelbrain/qemu-reims-vgpu`), at the commit this checkout
 pins, and Cargo fetches metal2vulkan from its public repository, at the commit the workspace's
 `Cargo.toml` names. `reims-ctl doctor` checks the host and the install.
@@ -69,34 +70,62 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
 
 1. **Host prep.** You need KVM (`/dev/kvm`) and a Vulkan driver; `reims-ctl gpus` lists the GPUs a
    VM can be given. The library's views of guest memory take a kernel mapping for each run of
-   guest pages, so raise `vm.max_map_count`: `sudo sysctl -w vm.max_map_count=1048576` covers a
-   12 GiB guest, and a file in `/etc/sysctl.d` keeps it. `scripts/install-ctl.sh` and `reims-ctl`
-   warn when it is too low.
+   guest pages, so raise `vm.max_map_count`: `sudo sysctl -w vm.max_map_count=2097152` covers a
+   guest of up to 30 GiB, and a file in `/etc/sysctl.d` keeps it. `scripts/install-ctl.sh` and
+   `reims-ctl` warn when it is too low.
 
-2. **Get OpenCore and an installer with [OSX-KVM](https://github.com/kholia/OSX-KVM)** (or ULTMOS).
-   Follow that project's docs to fetch the recovery image and build OpenCore. You only need its
-   pieces, not its launcher: `reims-ctl` copies the OpenCore image into the VM and finds OVMF beside
-   it, or uses QEMU's own.
+   On an AMD GPU, the guest's memory reaches the GPU through `/dev/udmabuf`, so you need to be in
+   the group that owns it (`kvm` on Ubuntu, the same group as `/dev/kvm`). `reims-ctl` warns when a
+   VM on an AMD GPU can't open it.
+
+2. **Create a VM.** Run `reims-ctl`, press `n`, pick a macOS version and press Ctrl-S. It downloads
+   the installer from Apple and makes the VM's OpenCore image and disk; then press `s` to start it.
+   Or from a shell:
 
    ```sh
-   reims-ctl create mac --opencore ~/OSX-KVM/OpenCore/OpenCore.qcow2 \
-     --installer ~/OSX-KVM/BaseSystem.dmg       # a new 128G disk
-   reims-ctl create mac --from-script ~/OSX-KVM/OpenCore-Boot.sh   # or take all a launch script names
-   reims-ctl start mac
+   reims-ctl create mac --macos tahoe --start              # about 1 GB; installs the newest Tahoe
+   reims-ctl create mac --macos 26.6.2 --offline --start   # one exact release, 13 to 20 GB
    ```
 
-   `--disk` uses an existing disk instead (copied, reflinked where the file system can; as a qcow2
-   overlay; or in place), and `reims-ctl eject mac` takes the installer out once macOS is
-   installed.
+   The VM boots into macOS Recovery. Open Disk Utility, erase the VM's disk (QEMU HARDDISK Media)
+   as APFS, and pick Reinstall macOS; with the offline installer, run
+   `sh /Volumes/Installer/install-macos.sh` in Terminal instead. Once macOS is installed,
+   `reims-ctl eject mac` takes the installer out. Downloads are kept for your next VM, in
+   `~/.local/share/reims-ctl/installers` (delete them there to get the space back, once your VMs'
+   installers are ejected), and an interrupted one picks up where it stopped.
 
-3. **Set Metal's error mode in the guest**, once:
+   Already have macOS on a disk? `--disk` uses it (copied, reflinked where the file system can, or
+   in place), and `--opencore` the OpenCore image it booted with, with OVMF beside it, which keeps
+   its Mac identity. `--installer` takes an installer of your own.
+
+3. **Set Metal's error mode in the guest**, once. Without it, macOS's icon service crashes as soon
+   as it starts, and a fresh install never gets past its wallpaper: no menu bar, no Dock. Since
+   there's no desktop yet, you set it from macOS Recovery:
+
+   1. Start the VM, and pick the Recovery entry in OpenCore's picker before it boots macOS (it
+      waits 5 seconds; any arrow key stops the countdown, and Space shows the entry if it's
+      hidden).
+   2. In Recovery, open Utilities > Terminal and type:
+
+      ```sh
+      cd /Volumes/*Data/Library/Preferences
+      defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5
+      chmod 644 .GlobalPreferences.plist
+      reboot
+      ```
+
+      Don't skip the `chmod`: without it, macOS can't read the setting.
+   3. Pick macOS in the picker. The desktop should come up.
+
+   If you already have a desktop, run this in its Terminal instead, then restart:
 
    ```sh
    sudo defaults write /Library/Preferences/.GlobalPreferences METAL_ERROR_MODE -int 5
    ```
 
-   Without it the guest's icon service crash-loops, and apps wait minutes for their icons
-   ([docs/qemu.md](docs/qemu.md), "x86-64 macOS guests: Metal's error mode").
+   If a Dock icon stays blank afterwards, clear the Dock's icon cache:
+   `rm -rf "$(getconf DARWIN_USER_CACHE_DIR)com.apple.dock.iconcache"; killall Dock`.
+   [docs/qemu.md](docs/qemu.md) ("x86-64 macOS guests: Metal's error mode") has the details.
 
 ### arm64 guest on an Apple silicon Mac (HVF / vmapple)
 
@@ -123,7 +152,7 @@ bug report.
 
 ```sh
 reims-ctl list                  # the VMs and whether they run
-reims-ctl set mac --memory 12G --resolution host   # applies at the next start
+reims-ctl set mac --memory 12G --resolution 1920x1080   # applies at the next start
 reims-ctl command mac           # the QEMU command it runs, as a shell script
 reims-ctl report mac            # logs, settings and the host's details, zipped, for a bug report
 reims-ctl update                # pull the checkout and install again

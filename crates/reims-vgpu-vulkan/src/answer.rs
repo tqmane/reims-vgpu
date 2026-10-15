@@ -1495,7 +1495,8 @@ fn dies(sel: &'static str, line: &str) -> ! {
 /// handles (an argument buffer's or a heap's), or a constexpr sampler whose modes the runtime
 /// cannot map, which it maps where its modes are stated and the map sends each to one a constexpr
 /// sampler addresses, and refuses otherwise; and where it is a refusal of SIMD-group operations
-/// in a stage, the stage and the class ([`simd_stage`]).
+/// in a stage, the stage and the class ([`simd_stage`]); and where it is a refusal of host memory
+/// after the import's dma-buf source made none, why it made none ([`host_memory_refusal`]).
 pub fn refusal(e: &Error) -> String {
     use metal2vulkan_runtime::{MappedSampling, RuntimeGap};
     let path = match e {
@@ -1522,10 +1523,23 @@ pub fn refusal(e: &Error) -> String {
                  gpu::ycbcr's family) is sampled {path}"
             )
         })
-        .or_else(|| simd_stage(e));
+        .or_else(|| simd_stage(e))
+        .or_else(|| host_memory_refusal(e));
     match named {
         Some(named) => format!("the Vulkan runtime refused it: {e}; {named}"),
         None => format!("the Vulkan runtime refused it: {e}"),
+    }
+}
+
+/// What a refusal of host memory names, for [`refusal`]: why the import's dma-buf source on this
+/// thread made no dma-buf of its pages (`crate::os::host_memory`), such as udmabuf's limits, which
+/// the device would have imported where it refuses the pages as host memory. `None` for any other
+/// refusal, and where the source made one or was not asked.
+fn host_memory_refusal(e: &Error) -> Option<String> {
+    use metal2vulkan::error::Feature;
+    match e {
+        Error::Unsupported(u) if u.feature == Feature::HostMemory => crate::os::dma_buf_refusal(),
+        _ => None,
     }
 }
 

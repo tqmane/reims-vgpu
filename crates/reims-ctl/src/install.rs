@@ -83,30 +83,6 @@ pub fn qemu_img(profile: Profile) -> Result<PathBuf> {
     Ok(img)
 }
 
-/// QEMU's data directory for `qemu`: `share/qemu` in an install prefix, or `qemu-bundle`'s in
-/// a build tree.
-pub fn qemu_data_dir(qemu: &Path) -> Option<PathBuf> {
-    let dir = qemu.parent()?;
-    let installed = dir.parent()?.join("share/qemu");
-    if installed.is_dir() {
-        return Some(installed);
-    }
-    let bundle = dir.join("qemu-bundle");
-    if bundle.is_dir() {
-        // The bundle mirrors the configured prefix: find its share/qemu.
-        let mut stack = vec![bundle];
-        while let Some(d) = stack.pop() {
-            if d.ends_with("share/qemu") {
-                return Some(d);
-            }
-            if let Ok(rd) = std::fs::read_dir(&d) {
-                stack.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
-            }
-        }
-    }
-    None
-}
-
 /// The audio backends `qemu` was built with (`-audiodev help`), cached per binary.
 pub fn audio_backends(qemu: &Path) -> Vec<String> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Vec<String>>>> = OnceLock::new();

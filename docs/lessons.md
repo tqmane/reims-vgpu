@@ -60,3 +60,16 @@ one. A new trap found the same way goes here.
 - nextest's `--stress-count` with `--no-fail-fast` exits with the last iteration's status only. **Measured** with cargo-nextest 0.9.140: a test that failed in iteration 1 of 3 and passed in 2 and 3 exited 0, under the summary `3/3 stress run iterations: 2 passed, 1 failed`; without `--no-fail-fast` the first failure stops the run and it exits 100. Count failures from the summary line, never from the exit code.
 - A staged gitlink needs an index commit. In a worktree with an uninitialised submodule, `git commit -- <paths>` can record the old gitlink while leaving its newer staged pin behind. This happened after the native WHPX fix: the source and build had the fix, but the parent commit still pinned its predecessor. Stage only reviewed paths, check the exact staged set, commit that index, and verify `git ls-tree HEAD vendor/qemu` against the tested QEMU commit before pushing. Do not initialise a shared submodule to make a path-based commit work.
 - A warm firmware spin can be a failed reset invariant. On WHPX, zeroing QEMU's CPU environment left native fixed MTRRs enabled; the next OVMF boot asserted and entered CpuDeadLoop. Read the stopped instruction and assertion before calling a spin an AP or interrupt stall. Reset the native MTRR banks as well as extended and interrupt state, and check a second firmware boot in the same process. A cold boot cannot expose stale native registers.
+- A native GPU can reach a refusal a MoltenVK-only fixture never did. The resolve test ended its RG11B10Float pass before entering its death capture; on NVIDIA the real rounding notice correctly killed that end. Capture and check the actual end on a device that announces the notice, as well as testing the descriptor decision. Do not relax strict policy to make a fixture portable.
+- A source fingerprint reads checkout bytes, not Git's normalized blob. Windows `core.autocrlf` changed the runtime guard's hash although its Git diff was empty. LF checkout attributes make the same source hash reproducible on both hosts. Reproduce the upstream pin before repinning the fork; never replace a failing guard with the host's hash without checking its input bytes and paths.
+
+## Build inputs and live editors
+
+- A commit preserves a fix but does not keep the working file equal to it.
+  A stale external write after a successful build can make a later rebuild
+  omit the fix while retaining the earlier test results. The Metal bridge
+  exporter rejects dirty source, reads a fixed Git revision, and hashes every
+  exported file. Its build compiles a private copy and verifies the inputs
+  again before publishing. Keep that manifest in the signed bundle and pair
+  test results with it. An unexpected live-file change still needs writer
+  attribution; a manifest prevents a mismatched release, not the write itself.

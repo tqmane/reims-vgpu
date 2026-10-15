@@ -264,12 +264,15 @@ impl Drop for OwnMemory {
     }
 }
 
-/// A new file of `length` bytes of zeros in memory (`memfd_create`). Where the kernel gives none,
-/// the process ends there, naming the error and the open-file limit (module docs).
+/// A new file of `length` bytes of zeros in memory (`memfd_create`), sealed against growing and
+/// shrinking, as `/dev/udmabuf` takes only a memfd sealed against shrinking
+/// ([`super::dma_buf`]). Where the kernel gives none, the process ends there, naming the error and
+/// the open-file limit (module docs).
 pub(crate) fn memfd(length: u64) -> Arc<OwnedFd> {
     let name = c"reims-vgpu";
     // SAFETY: a NUL-terminated name.
-    let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let raw =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if raw < 0 {
         no_file("memfd_create", length);
     }
@@ -281,6 +284,11 @@ pub(crate) fn memfd(length: u64) -> Arc<OwnedFd> {
     // SAFETY: an open memfd.
     if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } != 0 {
         no_file("ftruncate", length);
+    }
+    let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    // SAFETY: an open memfd made to take seals.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        no_file("fcntl(F_ADD_SEALS)", length);
     }
     Arc::new(fd)
 }

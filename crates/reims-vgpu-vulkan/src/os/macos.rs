@@ -172,6 +172,22 @@ pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView
     ImportView { at }
 }
 
+/// The runtime's host memory at `at`, the first byte of an import ([`ImportView::at`]): the bytes
+/// alone, which MoltenVK imports as Metal does.
+///
+/// # Safety
+///
+/// `rt::HostMemory::new`'s contract, for the memory at `at`.
+pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>) -> rt::HostMemory {
+    // SAFETY: the caller's.
+    unsafe { rt::HostMemory::new(at) }
+}
+
+/// Why this thread's last dma-buf source made none: never, on macOS, where imports carry none.
+pub(crate) fn dma_buf_refusal() -> Option<String> {
+    None
+}
+
 /// The address whose bytes the runtime's memory at `at` shows: `at`, on macOS.
 pub(crate) fn shown_at(at: std::ptr::NonNull<u8>) -> std::ptr::NonNull<u8> {
     at

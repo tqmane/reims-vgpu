@@ -4,7 +4,7 @@
 //! Every profile gets:
 //! - the library's window for each display: `-display none` with `REIMS_VGPU_WINDOW` unset
 //!   (`0` would keep apple-gfx headless), never a window of QEMU's own;
-//! - a QMP socket (`-qmp`), through which reims-ctl stops the VM and changes its CD;
+//! - a QMP socket (`-qmp`), through which reims-ctl stops the VM;
 //! - QEMU's pid file;
 //! - user networking with virtio-net, and an optional SSH port forward;
 //! - a USB Audio Class device on the host's audio backend: x86-64 macOS 26 has no Intel HDA
@@ -20,7 +20,7 @@
 //! `vmapple-arm64` follows scripts/run_vmapple.sh.
 
 use crate::host::{Host, Os, Profile};
-use crate::vm::{MediaKind, Vm};
+use crate::vm::Vm;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -180,38 +180,20 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         "-device",
         &format!("ide-hd,bus=sata.{},drive=disk,rotation_rate=1", q.disk_port),
     ]);
-    // The installer's port: the next after the disk's, past OpenCore's.
-    let media_port = if q.disk_port == 4 { 5 } else { 4 };
-    let kind = q
-        .installer
-        .as_deref()
-        .map(|p| q.installer_kind.unwrap_or_else(|| MediaKind::for_path(p)));
-    match (q.installer.as_deref().map(|p| vm.path(p)), kind) {
-        (Some(p), Some(MediaKind::Disk)) => {
-            push(&[
-                "-drive",
-                &format!(
-                    "id=installer,if=none,format=raw,snapshot=on,file={}",
-                    optp(&p)
-                ),
-            ]);
-            push(&[
-                "-device",
-                &format!("ide-hd,bus=sata.{media_port},drive=installer"),
-            ]);
-        }
-        (p, _) => {
-            // A CD drive, empty or with the installer's disc, so a disc can go in while it runs.
-            let file = p.map(|p| format!(",file={}", optp(&p))).unwrap_or_default();
-            push(&[
-                "-drive",
-                &format!("id=cd,if=none,media=cdrom,readonly=on{file}"),
-            ]);
-            push(&[
-                "-device",
-                &format!("ide-cd,bus=sata.{media_port},drive=cd,id=cdrom"),
-            ]);
-        }
+    // The installer, on the next port after the disk's, past OpenCore's.
+    if let Some(p) = q.installer.as_deref().map(|p| vm.path(p)) {
+        let port = if q.disk_port == 4 { 5 } else { 4 };
+        push(&[
+            "-drive",
+            &format!(
+                "id=installer,if=none,format=raw,snapshot=on,file={}",
+                optp(&p)
+            ),
+        ]);
+        push(&[
+            "-device",
+            &format!("ide-hd,bus=sata.{port},drive=installer"),
+        ]);
     }
     if c.network.enabled {
         push(&["-netdev", &netdev(vm)]);
@@ -453,7 +435,6 @@ mod tests {
                     firmware_code: "OVMF_CODE.fd".into(),
                     firmware_vars: "OVMF_VARS.fd".into(),
                     installer: None,
-                    installer_kind: None,
                     cpu_model: default_cpu_model(),
                     cpu_flags: default_cpu_flags(),
                     disk_port: 3,
@@ -497,7 +478,6 @@ mod tests {
             &["-device", "ich9-ahci,id=sata,addr=0x2"],
             &["-device", "ide-hd,bus=sata.2,drive=opencore,bootindex=1"],
             &["-device", "ide-hd,bus=sata.3,drive=disk,rotation_rate=1"],
-            &["-drive", "id=cd,if=none,media=cdrom,readonly=on"],
             &[
                 "-netdev",
                 "user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:2326-:22",
@@ -519,6 +499,7 @@ mod tests {
             assert!(has(a, pair), "missing {pair:?} in {a:?}");
         }
         assert!(!a.iter().any(|x| x == "-usb"), "no EHCI");
+        assert!(!a.iter().any(|x| x.contains("installer")), "no installer");
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
         assert!(inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
     }
@@ -528,7 +509,6 @@ mod tests {
         let mut vm = q35_vm();
         let q = vm.config.q35.as_mut().unwrap();
         q.installer = Some("/isos/Base,System.img".into());
-        q.installer_kind = Some(MediaKind::Disk);
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(has(
             &a,
@@ -547,17 +527,6 @@ mod tests {
             &[
                 "-drive",
                 "id=installer,if=none,format=raw,snapshot=on,file=/vms/t/installer.img"
-            ]
-        ));
-        let q = vm.config.q35.as_mut().unwrap();
-        q.installer = Some("/isos/x.iso".into());
-        q.installer_kind = None;
-        let a = invocation(&vm, &ctx(linux())).unwrap().args;
-        assert!(has(
-            &a,
-            &[
-                "-drive",
-                "id=cd,if=none,media=cdrom,readonly=on,file=/isos/x.iso"
             ]
         ));
     }

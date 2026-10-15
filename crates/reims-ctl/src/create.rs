@@ -1,11 +1,12 @@
 //! Making a VM: its directory, disks, firmware and `vm.toml`, then its registry entry.
 //!
-//! An x86-64 VM (`q35-x86_64`) boots OpenCore from its own copy of an OpenCore image, with its
-//! own copies of OVMF's halves, and a new disk or an existing one (copied, reflinked where the
-//! file system can; a qcow2 overlay over it; or used in place). An existing OSX-KVM or ULTMOS
-//! launch script can supply what it names: the disk, OpenCore image, firmware, installer, CPU
-//! model and flags, and MAC. An installer is used in place, except a DMG, which qemu-img
-//! converts to a raw image in the VM's directory ([`installer_media`]).
+//! An x86-64 VM (`q35-x86_64`) boots OpenCore from an OpenCore image of its own, with its own
+//! OVMF code and variables: made for it by reims-util, or copies of an image given and the OVMF
+//! beside it ([`firmware_beside`]). Its disk is a new one or an existing one (copied, reflinked
+//! where the file system can, or used in place). A new disk needs an installer: one reims-util
+//! downloads from Apple (reims_util.rs), before the VM's directory is made, so a download
+//! stopped part way leaves no VM half made, or one given. An installer is used in place, except
+//! a DMG, which qemu-img converts to a raw image in the VM's directory ([`installer_media`]).
 //!
 //! An arm64 VM (`vmapple-arm64`) is one Virtualization.framework made: installed here from an
 //! IPSW (vz.rs), or imported from macosvm's or tart's directory (an APFS clone of its disk and
@@ -14,6 +15,7 @@
 use crate::host::{Host, Profile};
 use crate::install;
 use crate::paths;
+use crate::reims_util::{self, Download};
 use crate::vm::*;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -24,8 +26,6 @@ use std::process::Command;
 pub enum ImportMode {
     /// A copy in the VM's directory: reflinked (btrfs, XFS) or cloned (APFS) where it can be.
     Copy,
-    /// A qcow2 overlay over the image, which must then stay.
-    Overlay,
     /// The image itself.
     InPlace,
 }
@@ -34,9 +34,8 @@ impl ImportMode {
     pub fn parse(s: &str) -> Result<ImportMode> {
         Ok(match s {
             "copy" | "clone" => ImportMode::Copy,
-            "overlay" => ImportMode::Overlay,
             "in-place" | "inplace" | "link" => ImportMode::InPlace,
-            _ => bail!("import mode is copy, overlay or in-place, not {s:?}"),
+            _ => bail!("import mode is copy or in-place, not {s:?}"),
         })
     }
 }
@@ -62,13 +61,10 @@ pub struct Spec {
     pub ssh_port: Option<u16>,
     pub mac: Option<String>,
     // q35
-    pub from_script: Option<PathBuf>,
+    /// macOS to download from Apple, for the installer.
+    pub macos: Option<Download>,
     pub opencore: Option<PathBuf>,
     pub installer: Option<PathBuf>,
-    pub firmware_code: Option<PathBuf>,
-    pub firmware_vars: Option<PathBuf>,
-    pub cpu_model: Option<String>,
-    pub cpu_flags: Option<String>,
     // vmapple
     pub ipsw: Option<String>,
     pub bundle: Option<PathBuf>,
@@ -91,13 +87,9 @@ impl Spec {
             audio: true,
             ssh_port: None,
             mac: None,
-            from_script: None,
+            macos: None,
             opencore: None,
             installer: None,
-            firmware_code: None,
-            firmware_vars: None,
-            cpu_model: None,
-            cpu_flags: None,
             ipsw: None,
             bundle: None,
             bundle_mode: ImportMode::Copy,
@@ -164,8 +156,7 @@ pub fn default_dir(name: &str) -> PathBuf {
 /// Makes the VM, calling `progress` with each step, and registers it.
 pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<Vm> {
     check_name(&spec.name)?;
-    let mut reg = Registry::load()?;
-    if reg.find(&spec.name).is_some() {
+    if Registry::load()?.find(&spec.name).is_some() {
         bail!("a VM named {} already exists", spec.name);
     }
     let profile = match spec.profile {
@@ -185,9 +176,53 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
             dir.display()
         );
     }
+    // What was given is checked before the slow steps: a download, a disk's copy.
+    if let Some(DiskSource::Existing { path, .. }) = &spec.disk
+        && !path.is_file()
+    {
+        bail!("the disk {} does not exist", path.display());
+    }
+    let mut spec = spec;
+    // The macOS version, where an installer was downloaded for it.
+    let mut macos = None;
+    if profile == Profile::Q35X86_64 {
+        if spec.macos.is_some() && spec.installer.is_some() {
+            bail!("give macOS to download or an installer, not both");
+        }
+        if let Some(i) = &spec.installer
+            && !i.exists()
+        {
+            bail!("the installer {} does not exist", i.display());
+        }
+        match &spec.opencore {
+            Some(oc) => {
+                own_firmware(oc)?;
+            }
+            // reims-util makes one, after the disk's copy.
+            None => {
+                reims_util::binary()?;
+            }
+        }
+        if spec.macos.is_none()
+            && spec.installer.is_none()
+            && matches!(spec.disk, Some(DiskSource::New { .. }))
+        {
+            bail!(
+                "a new disk needs macOS installed on it: give the macOS to download \
+                 (--macos tahoe), or an installer"
+            );
+        }
+        if let Some(d) = spec.macos.take() {
+            let i = reims_util::installer(&d, progress)?;
+            spec.installer = Some(i.image);
+            macos = Some(i.version);
+        }
+    } else if spec.macos.is_some() {
+        bail!("an arm64 VM installs macOS from an IPSW (--ipsw latest)");
+    }
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let result = match profile {
-        Profile::Q35X86_64 => make_q35(&spec, host, &dir, progress),
+        Profile::Q35X86_64 => make_q35(&spec, host, &dir, macos.as_deref(), progress),
         Profile::VmappleArm64 => make_vmapple(&spec, host, &dir, progress),
     };
     let vm = match result {
@@ -208,6 +243,8 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
         }
     };
     vm.save()?;
+    // Read again: VMs may have come and gone while this one was made, over a download.
+    let mut reg = Registry::load()?;
     reg.add(&spec.name, &dir)?;
     reg.save()?;
     progress("done");
@@ -298,21 +335,15 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
     Ok(())
 }
 
-fn make_q35(spec: &Spec, _host: Host, dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Vm> {
-    let script = match &spec.from_script {
-        Some(p) => Some(LaunchScript::read(p)?),
-        None => None,
-    };
-    let s = script.clone().unwrap_or_default();
-
+fn make_q35(
+    spec: &Spec,
+    _host: Host,
+    dir: &Path,
+    macos: Option<&str>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Vm> {
     // The disk.
-    let disk_source = spec.disk.clone().or_else(|| {
-        s.disk.clone().map(|path| DiskSource::Existing {
-            path,
-            mode: ImportMode::Copy,
-        })
-    });
-    let (disk, disk_format) = match disk_source {
+    let (disk, disk_format) = match spec.disk.clone() {
         Some(DiskSource::New { size_mib }) => {
             progress("creating the disk");
             let d = dir.join("disk.qcow2");
@@ -335,82 +366,54 @@ fn make_q35(spec: &Spec, _host: Host, dir: &Path, progress: &mut dyn FnMut(&str)
         None => bail!("give the VM a disk: a new one's size, or an existing image"),
     };
 
-    // OpenCore.
-    let opencore_src = spec.opencore.clone().or(s.opencore.clone()).context(
-        "an x86-64 VM boots through an OpenCore image (OpenCore.qcow2, from OSX-KVM or ULTMOS): give its path",
-    )?;
-    progress("copying the OpenCore image");
-    let oc_format = ImageFormat::detect(&opencore_src)?;
-    let oc_name = format!(
-        "opencore.{}",
-        if oc_format == ImageFormat::Qcow2 {
-            "qcow2"
-        } else {
-            "img"
+    // OpenCore and OVMF: made for the VM, or copies of what was given. A Mac's ROM is its first
+    // network card's address, so a made image's is the VM's.
+    let mac = spec.mac.clone().unwrap_or_else(random_mac);
+    let (oc_name, oc_format) = match &spec.opencore {
+        None => {
+            reims_util::opencore(&dir.join("opencore.qcow2"), &mac, macos, progress)?;
+            (PathBuf::from("opencore.qcow2"), ImageFormat::Qcow2)
         }
-    );
-    copy_file(&opencore_src, &dir.join(&oc_name))?;
-
-    // Firmware.
-    let (code, vars) = match (
-        spec.firmware_code.clone().or(s.firmware_code.clone()),
-        spec.firmware_vars.clone().or(s.firmware_vars.clone()),
-    ) {
-        (Some(c), Some(v)) => (c, v),
-        (c, v) => {
-            let (fc, fv) = find_firmware(&opencore_src).context(
-                "no OVMF firmware found beside the OpenCore image, in QEMU's install or in the \
-                 system's OVMF package: install it (Ubuntu's ovmf, Arch's edk2-ovmf), or give \
-                 --firmware-code and --firmware-vars",
-            )?;
-            (c.unwrap_or(fc), v.unwrap_or(fv))
+        Some(src) => {
+            progress("copying the OpenCore image");
+            let format = ImageFormat::detect(src)?;
+            let name = format!(
+                "opencore.{}",
+                if format == ImageFormat::Qcow2 {
+                    "qcow2"
+                } else {
+                    "img"
+                }
+            );
+            copy_file(src, &dir.join(&name))?;
+            (PathBuf::from(name), format)
         }
     };
-    progress("copying the firmware");
-    copy_file(&code, &dir.join("OVMF_CODE.fd"))?;
-    copy_file(&vars, &dir.join("OVMF_VARS.fd"))?;
+    // An image given brings its OVMF beside it, as a made one's is written beside it.
+    if let Some(src) = &spec.opencore {
+        let (code, vars) = own_firmware(src)?;
+        progress("copying the firmware");
+        copy_file(&code, &dir.join("OVMF_CODE.fd"))?;
+        copy_file(&vars, &dir.join("OVMF_VARS.fd"))?;
+    }
     // A read-only source's copy is read-only too; the variables are written.
     let _ = make_writable(&dir.join("OVMF_VARS.fd"));
 
-    let installer = match spec.installer.clone().or(s.installer.clone()) {
-        Some(i) if !i.exists() => bail!("the installer {} does not exist", i.display()),
+    let installer = match spec.installer.clone() {
         Some(i) => Some(installer_media(&i, dir, progress)?),
         None => None,
     };
     let mut c = base_config(spec, Profile::Q35X86_64, disk, disk_format);
-    if spec.cpus.is_none()
-        && let Some(n) = s.cpus
-    {
-        c.cpus = n;
-    }
-    if spec.memory_mib.is_none()
-        && let Some(m) = s.memory_mib
-    {
-        c.memory_mib = m;
-    }
-    if spec.mac.is_none()
-        && let Some(m) = &s.mac
-    {
-        c.network.mac = m.clone();
-    }
+    c.network.mac = mac;
     c.q35 = Some(Q35 {
-        opencore: oc_name.into(),
+        opencore: oc_name,
         opencore_format: oc_format,
         firmware_code: "OVMF_CODE.fd".into(),
         firmware_vars: "OVMF_VARS.fd".into(),
-        installer_kind: installer.as_deref().map(MediaKind::for_path),
         installer,
-        cpu_model: spec
-            .cpu_model
-            .clone()
-            .or(s.cpu_model.clone())
-            .unwrap_or_else(default_cpu_model),
-        cpu_flags: spec
-            .cpu_flags
-            .clone()
-            .or(s.cpu_flags.clone())
-            .unwrap_or_else(default_cpu_flags),
-        disk_port: s.disk_port.unwrap_or(3),
+        cpu_model: default_cpu_model(),
+        cpu_flags: default_cpu_flags(),
+        disk_port: 3,
     });
     Ok(Vm {
         dir: dir.to_path_buf(),
@@ -454,26 +457,6 @@ fn import_disk(
             let _ = make_writable(&dir.join(&name));
             (PathBuf::from(name), format)
         }
-        ImportMode::Overlay => {
-            progress(&format!("creating an overlay over {}", file_name(&src)));
-            let name = format!("{stem}.qcow2");
-            let d = dir.join(&name);
-            qemu_img(
-                Profile::Q35X86_64,
-                &[
-                    "create".as_ref(),
-                    "-q".as_ref(),
-                    "-f".as_ref(),
-                    "qcow2".as_ref(),
-                    "-b".as_ref(),
-                    src.as_os_str(),
-                    "-F".as_ref(),
-                    format.as_str().as_ref(),
-                    d.as_os_str(),
-                ],
-            )?;
-            (PathBuf::from(name), ImageFormat::Qcow2)
-        }
     })
 }
 
@@ -496,14 +479,15 @@ pub fn is_dmg(p: &Path) -> Result<bool> {
 }
 
 /// The installer a VM in `dir` attaches for `src`: `src` itself, used in place, or, for a DMG
-/// (the BaseSystem.dmg OSX-KVM's fetch-macOS-v2.py downloads), a raw copy qemu-img writes into
-/// `dir`, named relative to it. QEMU could read the DMG itself, but decompresses a whole chunk
-/// for each read outside the last one: 4 KiB reads 1 MiB apart took 2.5 ms each from a 2.5 GiB
-/// recovery image against 0.05 ms from its raw copy, which took 10 s to make (measured on a
-/// Ryzen 7 7840HS).
+/// (a recovery image, BaseSystem.dmg, which is what reims-util's online installer is), a raw
+/// copy qemu-img writes into `dir`, named relative to it. QEMU could read the DMG itself, but
+/// decompresses a whole chunk for each read outside the last one: 4 KiB reads 1 MiB apart took
+/// 2.5 ms each from a 2.5 GiB recovery image against 0.05 ms from its raw copy, which took 10 s
+/// to make (measured on a Ryzen 7 7840HS).
 ///
-/// The installed QEMU reads zlib DMGs (the recovery image fetch-macOS-v2.py downloaded is one);
-/// bzip2 and LZFSE ones only where it was built with their libraries, and LZMA and ADC ones never.
+/// The installed QEMU reads zlib DMGs (Apple's recovery images, as osrecovery.apple.com serves
+/// them, are); bzip2 and LZFSE ones only where it was built with their libraries, and LZMA and
+/// ADC ones never.
 pub fn installer_media(src: &Path, dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<PathBuf> {
     if !is_dmg(src)? {
         return Ok(src.to_path_buf());
@@ -544,70 +528,27 @@ pub fn installer_media(src: &Path, dir: &Path, progress: &mut dyn FnMut(&str)) -
     Ok(PathBuf::from(INSTALLER_COPY))
 }
 
-/// OVMF's code and variables: beside the OpenCore image (OSX-KVM keeps them in its root, ULTMOS
-/// in `ovmf/`), else QEMU's own edk2 build, else the system's edk2/OVMF package.
-pub fn find_firmware(opencore: &Path) -> Option<(PathBuf, PathBuf)> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(d) = opencore.parent() {
-        for base in [Some(d), d.parent()].into_iter().flatten() {
-            dirs.push(base.to_path_buf());
-            dirs.push(base.join("ovmf"));
-            dirs.push(base.join("OVMF"));
-        }
+/// OVMF's code and variables beside an OpenCore image of the user's, as reims-util writes them
+/// beside the images it makes and a VM's directory holds them.
+pub fn firmware_beside(opencore: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dir = opencore.parent()?;
+    let (code, vars) = (dir.join("OVMF_CODE.fd"), dir.join("OVMF_VARS.fd"));
+    (code.is_file() && vars.is_file()).then_some((code, vars))
+}
+
+/// The OVMF beside `opencore`, an OpenCore image of the user's, or why there is none.
+fn own_firmware(opencore: &Path) -> Result<(PathBuf, PathBuf)> {
+    if !opencore.is_file() {
+        bail!("the OpenCore image {} does not exist", opencore.display());
     }
-    for d in &dirs {
-        let code = ["OVMF_CODE.fd", "OVMF_CODE_4M.fd", "OVMF_CODE.4m.fd"]
-            .iter()
-            .map(|n| d.join(n))
-            .find(|p| p.is_file());
-        let vars = [
-            "OVMF_VARS.fd",
-            "OVMF_VARS-1920x1080.fd",
-            "OVMF_VARS_4M.fd",
-            "OVMF_VARS.4m.fd",
-        ]
-        .iter()
-        .map(|n| d.join(n))
-        .find(|p| p.is_file());
-        if let (Some(c), Some(v)) = (code, vars) {
-            return Some((c, v));
-        }
-    }
-    if let Some(share) = install::qemu_binary(Profile::Q35X86_64)
-        .ok()
-        .and_then(|q| install::qemu_data_dir(&q))
-    {
-        let (c, v) = (
-            share.join("edk2-x86_64-code.fd"),
-            share.join("edk2-i386-vars.fd"),
-        );
-        if c.is_file() && v.is_file() {
-            return Some((c, v));
-        }
-    }
-    for (c, v) in [
-        (
-            "/usr/share/OVMF/OVMF_CODE_4M.fd",
-            "/usr/share/OVMF/OVMF_VARS_4M.fd",
-        ),
-        (
-            "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
-            "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
-        ),
-        (
-            "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-            "/usr/share/edk2/ovmf/OVMF_VARS.fd",
-        ),
-        (
-            "/usr/share/OVMF/OVMF_CODE.fd",
-            "/usr/share/OVMF/OVMF_VARS.fd",
-        ),
-    ] {
-        if Path::new(c).is_file() && Path::new(v).is_file() {
-            return Some((c.into(), v.into()));
-        }
-    }
-    None
+    firmware_beside(opencore).with_context(|| {
+        format!(
+            "no OVMF_CODE.fd and OVMF_VARS.fd beside {}: copy the OVMF code and variables it \
+             boots with beside it under those names, or give no OpenCore image to have one made \
+             for the VM",
+            opencore.display()
+        )
+    })
 }
 
 fn make_vmapple(spec: &Spec, host: Host, dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Vm> {
@@ -626,9 +567,6 @@ fn make_vmapple(spec: &Spec, host: Host, dir: &Path, progress: &mut dyn FnMut(&s
                 copy_file(&b.disk, &dir.join("disk.img"))?;
                 copy_file(&b.aux, &dir.join("aux.img"))?;
                 (PathBuf::from("disk.img"), PathBuf::from("aux.img"))
-            }
-            ImportMode::Overlay => {
-                bail!("a vmapple VM's disk is raw: import it as a copy or in place")
             }
         };
         let mut c = base_config(spec, Profile::VmappleArm64, disk, ImageFormat::Raw);
@@ -680,227 +618,6 @@ fn make_vmapple(spec: &Spec, host: Host, dir: &Path, progress: &mut dyn FnMut(&s
     bail!(
         "an arm64 VM is installed from an IPSW (--ipsw PATH, or --ipsw latest), or imported from a Virtualization.framework VM's directory (--bundle)"
     )
-}
-
-// ---------------------------------------------------------------- launch scripts
-
-/// `p`, a path a launch script names, or where it went: a missing path is looked up in the
-/// script's directory `dir` by its last components, the longest that exist first. ULTMOS writes
-/// the absolute directory it was set up in into its script, which is wrong once the VM is
-/// copied or moved.
-fn relocated(p: PathBuf, dir: &Path) -> PathBuf {
-    if p.exists() {
-        return p;
-    }
-    let parts: Vec<_> = p
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .collect();
-    (1..=parts.len())
-        .rev()
-        .map(|k| dir.join(parts[parts.len() - k..].iter().collect::<PathBuf>()))
-        .find(|c| c.exists())
-        .unwrap_or(p)
-}
-
-/// What an OSX-KVM or ULTMOS launch script names.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct LaunchScript {
-    pub disk: Option<PathBuf>,
-    pub disk_port: Option<u32>,
-    pub opencore: Option<PathBuf>,
-    pub firmware_code: Option<PathBuf>,
-    pub firmware_vars: Option<PathBuf>,
-    pub installer: Option<PathBuf>,
-    pub cpu_model: Option<String>,
-    pub cpu_flags: Option<String>,
-    pub mac: Option<String>,
-    pub cpus: Option<u32>,
-    pub memory_mib: Option<u64>,
-}
-
-impl LaunchScript {
-    pub fn read(path: &Path) -> Result<LaunchScript> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let dir = std::fs::canonicalize(path)?
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let mut s = LaunchScript::parse(&text, &dir);
-        for p in [
-            &mut s.disk,
-            &mut s.opencore,
-            &mut s.firmware_code,
-            &mut s.firmware_vars,
-            &mut s.installer,
-        ] {
-            *p = p.take().map(|p| relocated(p, &dir));
-        }
-        Ok(s)
-    }
-
-    pub fn parse(text: &str, dir: &Path) -> LaunchScript {
-        let mut vars: BTreeMap<String, String> = BTreeMap::new();
-        let lines: Vec<&str> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with('#'))
-            .collect();
-        for l in &lines {
-            if let Some((k, v)) = l.split_once('=')
-                && !k.is_empty()
-                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !k.starts_with(|c: char| c.is_ascii_digit())
-            {
-                let v = v.split(" #").next().unwrap_or(v).trim();
-                let v = v.trim_matches('"').trim_matches('\'');
-                let v = expand_vars(v, &vars);
-                vars.insert(k.to_string(), v);
-            }
-        }
-        let body: String = lines
-            .iter()
-            .map(|l| expand_vars(l, &vars))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let resolve = |p: &str| -> PathBuf {
-            let p = paths::expand(p.trim_matches('"').trim_matches('\''));
-            if p.is_absolute() { p } else { dir.join(p) }
-        };
-        let mut s = LaunchScript::default();
-        // -cpu MODEL,opts.
-        if let Some(i) = body.find("-cpu ") {
-            let rest = body[i + 5..].trim_start();
-            let tok: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-            let tok = tok.replace('"', "");
-            let mut parts = tok.split(',');
-            if let Some(model) = parts
-                .next()
-                .filter(|m| !m.is_empty() && !m.starts_with('$'))
-            {
-                s.cpu_model = Some(model.to_string());
-            }
-            let own = [
-                "kvm=on",
-                "vendor=GenuineIntel",
-                "+invtsc",
-                "vmware-cpuid-freq=on",
-            ];
-            let flags: Vec<&str> = parts
-                .filter(|p| !p.is_empty() && !own.contains(p))
-                .collect();
-            if !flags.is_empty() {
-                s.cpu_flags = Some(flags.join(","));
-            }
-        }
-        // Drives: each file= path, by what it names; the disk's AHCI port from its ide-hd.
-        let mut drive_ids: BTreeMap<String, PathBuf> = BTreeMap::new();
-        for line in body.lines() {
-            let Some(i) = line.find("file=") else {
-                continue;
-            };
-            let rest = &line[i + 5..];
-            let rest = rest.trim_start_matches('"');
-            let end = rest.find(['"', ',', ' ']).unwrap_or(rest.len());
-            let file = &rest[..end];
-            if file.is_empty() {
-                continue;
-            }
-            let p = resolve(file);
-            let low = file.to_ascii_lowercase();
-            let id = line
-                .split(['-', ' ', ','])
-                .find_map(|t| t.strip_prefix("id="))
-                .map(|t| t.trim_matches('"').to_string());
-            if low.contains("ovmf_code") || low.contains("ovmf-code") {
-                s.firmware_code = Some(p);
-            } else if low.contains("ovmf_vars") || low.contains("ovmf-vars") {
-                s.firmware_vars = Some(p);
-            } else if low.contains("opencore") {
-                s.opencore = Some(p);
-            } else if low.contains("basesystem") || low.ends_with(".iso") || low.contains("install")
-            {
-                s.installer = Some(p);
-            } else if (low.ends_with(".qcow2") || low.ends_with(".img") || low.ends_with(".raw"))
-                && s.disk.is_none()
-            {
-                s.disk = Some(p.clone());
-                if let Some(id) = &id {
-                    drive_ids.insert(id.clone(), p);
-                }
-            }
-        }
-        if let Some(disk) = &s.disk {
-            for line in body.lines() {
-                if let Some(id) = drive_ids.iter().find(|(_, p)| *p == disk).map(|(id, _)| id)
-                    && line.contains("ide-hd")
-                    && line.contains(&format!("drive={id}"))
-                    && let Some(port) = line
-                        .split(',')
-                        .find_map(|t| t.trim().strip_prefix("bus=sata."))
-                        .and_then(|n| n.trim_matches('"').parse().ok())
-                {
-                    s.disk_port = Some(port);
-                }
-            }
-        }
-        s.mac = vars
-            .get("MAC_ADDRESS")
-            .cloned()
-            .filter(|m| m.len() == 17)
-            .or_else(|| {
-                let i = body.find("mac=")?;
-                let m: String = body[i + 4..].chars().take(17).collect();
-                (m.len() == 17 && m.chars().filter(|c| *c == ':').count() == 5).then_some(m)
-            });
-        let num = |k: &str| vars.get(k).and_then(|v| v.parse::<u32>().ok());
-        if let Some(cores) = num("CPU_CORES") {
-            s.cpus =
-                Some(cores * num("CPU_THREADS").unwrap_or(1) * num("CPU_SOCKETS").unwrap_or(1));
-        }
-        if let Some(ram) = vars.get("ALLOCATED_RAM") {
-            // OSX-KVM gives MiB as a bare number; ULTMOS "12G".
-            s.memory_mib = if ram.chars().all(|c| c.is_ascii_digit()) {
-                ram.parse().ok()
-            } else {
-                parse_size_mib(ram).ok()
-            };
-        }
-        s
-    }
-}
-
-/// `$VAR` and `${VAR}` replaced from `vars`; others left as they are.
-fn expand_vars(s: &str, vars: &BTreeMap<String, String>) -> String {
-    let mut out = String::new();
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'$' {
-            let (name, next) = if b.get(i + 1) == Some(&b'{') {
-                match s[i + 2..].find('}') {
-                    Some(e) => (&s[i + 2..i + 2 + e], i + 3 + e),
-                    None => ("", i + 1),
-                }
-            } else {
-                let e = s[i + 1..]
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .map(|e| i + 1 + e)
-                    .unwrap_or(s.len());
-                (&s[i + 1..e], e)
-            };
-            if let Some(v) = vars.get(name).filter(|_| !name.is_empty()) {
-                out.push_str(v);
-                i = next;
-                continue;
-            }
-        }
-        let ch = s[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
 }
 
 // ---------------------------------------------------------------- Virtualization.framework VMs
@@ -1036,29 +753,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relocated_finds_a_moved_bundles_files() {
-        let d = std::env::temp_dir().join(format!("reims-ctl-relocated-{}", std::process::id()));
-        std::fs::create_dir_all(d.join("boot")).unwrap();
-        std::fs::write(d.join("boot/OpenCore.qcow2"), b"").unwrap();
-        std::fs::write(d.join("OpenCore.qcow2"), b"").unwrap();
-        let gone = Path::new("/nonexistent/vm/macos-26");
-        // The longest suffix that exists wins over a same-named file higher up.
-        assert_eq!(
-            relocated(gone.join("boot/OpenCore.qcow2"), &d),
-            d.join("boot/OpenCore.qcow2")
-        );
-        assert_eq!(
-            relocated(gone.join("HDD.qcow2"), &d),
-            gone.join("HDD.qcow2")
-        );
-        assert_eq!(
-            relocated(d.join("OpenCore.qcow2"), &d),
-            d.join("OpenCore.qcow2")
-        );
-        std::fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
     fn a_dmg_is_known_by_its_udif_trailer() {
         let d = std::env::temp_dir().join(format!("reims-ctl-dmg-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
@@ -1081,96 +775,19 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
-    const ULTMOS: &str = r#"
-ALLOCATED_RAM="12G"
-CPU_SOCKETS="1"
-CPU_CORES="8"
-CPU_THREADS="2"
-CPU_MODEL="Haswell-noTSX"
-CPU_FEATURE_ARGS="+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check"
-VM_PATH="/vm/macos-26"
-OVMF_DIR="/vm/macos-26/ovmf"
-MAC_ADDRESS="00:16:cb:00:21:09"
-HDD_PATH="$VM_PATH/HDD.qcow2"
-args=(
--enable-kvm -m "$ALLOCATED_RAM" -cpu "$CPU_MODEL",kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,"$CPU_FEATURE_ARGS"
--device isa-applesmc,osk="the-key"
--drive if=pflash,format=raw,readonly=on,file="$OVMF_DIR/OVMF_CODE.fd"
--drive if=pflash,format=raw,file="$OVMF_DIR/OVMF_VARS.fd"
--drive id=OpenCore,if=none,format=qcow2,file="$VM_PATH/boot/OpenCore.qcow2"
--drive id=HDD,if=none,file="$HDD_PATH",format=qcow2
--device ide-hd,bus=sata.2,drive=OpenCore,bootindex=1
--device ide-hd,bus=sata.3,drive=HDD,rotation_rate=1
--drive id=BaseSystem,if=none,file="$VM_PATH/BaseSystem.img",format=raw
-#-drive id=Commented,if=none,file="/nope.img"
-)
-"#;
-
     #[test]
-    fn reads_an_ultmos_script() {
-        let s = LaunchScript::parse(ULTMOS, Path::new("/x"));
-        assert_eq!(s.disk.as_deref(), Some(Path::new("/vm/macos-26/HDD.qcow2")));
-        assert_eq!(s.disk_port, Some(3));
+    fn firmware_comes_from_beside_the_opencore_image() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-ovmf-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let oc = d.join("OpenCore.qcow2");
+        std::fs::write(d.join("OVMF_CODE.fd"), b"").unwrap();
+        assert_eq!(firmware_beside(&oc), None);
+        std::fs::write(d.join("OVMF_VARS.fd"), b"").unwrap();
         assert_eq!(
-            s.opencore.as_deref(),
-            Some(Path::new("/vm/macos-26/boot/OpenCore.qcow2"))
+            firmware_beside(&oc),
+            Some((d.join("OVMF_CODE.fd"), d.join("OVMF_VARS.fd")))
         );
-        assert_eq!(
-            s.firmware_code.as_deref(),
-            Some(Path::new("/vm/macos-26/ovmf/OVMF_CODE.fd"))
-        );
-        assert_eq!(
-            s.firmware_vars.as_deref(),
-            Some(Path::new("/vm/macos-26/ovmf/OVMF_VARS.fd"))
-        );
-        assert_eq!(
-            s.installer.as_deref(),
-            Some(Path::new("/vm/macos-26/BaseSystem.img"))
-        );
-        assert_eq!(s.cpu_model.as_deref(), Some("Haswell-noTSX"));
-        assert_eq!(
-            s.cpu_flags.as_deref(),
-            Some("+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check")
-        );
-        assert_eq!(s.mac.as_deref(), Some("00:16:cb:00:21:09"));
-        assert_eq!(s.cpus, Some(16));
-        assert_eq!(s.memory_mib, Some(12 * 1024));
-    }
-
-    #[test]
-    fn reads_an_osx_kvm_script() {
-        let text = r#"
-MY_OPTIONS="+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check"
-ALLOCATED_RAM="4096" # MiB
-CPU_SOCKETS="1"
-CPU_CORES="2"
-CPU_THREADS="4"
-REPO_PATH="."
-OVMF_DIR="."
-args=(
-  -enable-kvm -m "$ALLOCATED_RAM" -cpu Penryn,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,"$MY_OPTIONS"
-  -device isa-applesmc,osk="k2"
-  -drive if=pflash,format=raw,readonly=on,file="$REPO_PATH/$OVMF_DIR/OVMF_CODE.fd"
-  -drive if=pflash,format=raw,file="$REPO_PATH/$OVMF_DIR/OVMF_VARS-1920x1080.fd"
-  -drive id=OpenCoreBoot,if=none,snapshot=on,format=qcow2,file="$REPO_PATH/OpenCore/OpenCore.qcow2"
-  -device ide-hd,bus=sata.2,drive=OpenCoreBoot
-  -device ide-hd,bus=sata.3,drive=InstallMedia
-  -drive id=InstallMedia,if=none,file="$REPO_PATH/BaseSystem.img",format=raw
-  -drive id=MacHDD,if=none,file="$REPO_PATH/mac_hdd_ng.img",format=qcow2
-  -device ide-hd,bus=sata.4,drive=MacHDD
-)
-"#;
-        let s = LaunchScript::parse(text, Path::new("/osx"));
-        assert_eq!(s.disk.as_deref(), Some(Path::new("/osx/./mac_hdd_ng.img")));
-        assert_eq!(s.disk_port, Some(4));
-        assert_eq!(s.cpu_model.as_deref(), Some("Penryn"));
-        assert_eq!(s.memory_mib, Some(4096));
-        assert_eq!(s.cpus, Some(8));
-        assert_eq!(
-            s.installer.as_deref(),
-            Some(Path::new("/osx/./BaseSystem.img"))
-        );
-        assert!(s.firmware_vars.unwrap().ends_with("OVMF_VARS-1920x1080.fd"));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

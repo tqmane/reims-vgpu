@@ -19,7 +19,13 @@
 //! A buffer made over a twin answers the address it was made over as its contents
 //! ([`shown_at`]): the runtime's contents are the twin's. The twin goes once the runtime frees the
 //! import (its keep-alive, [`ImportView::release`]).
+//!
+//! Every import also carries a dma-buf source ([`host_memory`]): a device that refuses the pages
+//! as host memory, as RADV refuses any page with a file behind it, imports a dma-buf of the same
+//! pages instead (`super::dma_buf`). The runtime asks for it only where it would refuse the
+//! import otherwise, so every device that imports host memory imports as it did.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
@@ -56,7 +62,7 @@ pub(crate) fn allocate_zeros(len: u64) -> Result<HostAddr, KernReturn> {
 }
 
 /// Whether `fd` is a file of zeros.
-fn zeros(fd: &Arc<OwnedFd>) -> bool {
+pub(super) fn zeros(fd: &Arc<OwnedFd>) -> bool {
     ZERO_FILES.lock().iter().any(|z| Arc::ptr_eq(z, fd))
 }
 
@@ -118,6 +124,58 @@ impl ImportView {
     }
 }
 
+/// The runtime's host memory at `at`, the first byte of an import ([`ImportView::at`]), with a
+/// source of dma-bufs of its pages for a device that refuses them as host memory (module docs).
+/// The runtime keeps the source while the import lives, and calls it with no lock of its own
+/// held, with a window of the import's pages and the granule it binds chunks at: the whole
+/// import's when it makes it, and a texture's own pages, at a granule of their length, when it
+/// makes a texture over it. The source answers dma-bufs that are the window's pages in order, each
+/// within udmabuf's limits (`super::dma_buf`), which the runtime imports. A twin's window is the
+/// twinned memory's pages ([`shown_at`]), which a dma-buf takes whatever their protection. A call
+/// that makes none keeps its refusal on its thread for the death there ([`dma_buf_refusal`]), as
+/// the runtime then refuses the import as it would have, or makes the texture as it does where
+/// it cannot alias the memory.
+///
+/// # Safety
+///
+/// `rt::HostMemory::new`'s contract, for the memory at `at`.
+pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
+    // An earlier import's refusal is not this one's.
+    REFUSAL.with_borrow_mut(|kept| *kept = None);
+    let source: rt::DmaBufSource = Arc::new(|request: rt::DmaBufRequest| {
+        let first = shown_at(request.start).as_ptr().addr().to_u64();
+        let (length, granule) = (request.length, request.granule);
+        match super::dma_buf::of_pages(first, length, granule) {
+            Ok(chunks) => {
+                log::debug!(
+                    "{length:#x} bytes at {first:#x} as {} dma-bufs at a granule of {granule:#x}",
+                    chunks.len()
+                );
+                Ok(chunks)
+            }
+            Err(refusal) => {
+                let line = format!("no dma-buf of its {length:#x} bytes at {first:#x}: {refusal}");
+                log::debug!("{line}");
+                REFUSAL.with_borrow_mut(|kept| *kept = Some(line));
+                Err(std::io::Error::other(refusal.to_string()))
+            }
+        }
+    });
+    // SAFETY: the caller's.
+    unsafe { rt::HostMemory::with_dma_buf(at, source) }
+}
+
+thread_local! {
+    /// The last refusal of a dma-buf source on this thread ([`host_memory`]).
+    static REFUSAL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Why this thread's last dma-buf source made none, taken, for the death of an import the runtime
+/// refused after it ([`host_memory`]).
+pub(crate) fn dma_buf_refusal() -> Option<String> {
+    REFUSAL.with_borrow_mut(Option::take)
+}
+
 /// An address moved into a deallocator, which may run on any thread.
 struct SendPtr(NonNull<u8>);
 
@@ -149,6 +207,10 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     let Some(pieces) = files::pieces(first, end - first) else {
         return plain;
     };
+    log::debug!(
+        "an import of {length:#x} bytes at {start:#x}: {} runs of files",
+        twin_mappings(&pieces)
+    );
     if pieces.iter().all(|p| p.prot & libc::PROT_WRITE != 0) {
         return plain;
     }

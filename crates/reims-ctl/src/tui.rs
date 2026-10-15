@@ -12,7 +12,7 @@ use crate::gpu::GpuInfo;
 use crate::host::{Host, Os, Profile};
 use crate::update::Channel;
 use crate::vm::{Registry, Vm, format_mib, parse_resolution, parse_size_mib};
-use crate::{install, logs, paths, runtime, update};
+use crate::{install, logs, paths, reims_util, runtime, update};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -130,6 +130,10 @@ struct App {
     pending_select: Option<String>,
     /// A VM's logs for the run loop to show in less, which needs the terminal.
     pending_page: Option<(String, Vec<PathBuf>)>,
+    /// A VM for the run loop to show in the terminal viewer, which needs the terminal.
+    pending_view: Option<Vm>,
+    /// The macOS versions reims-util downloads, read when the first x86-64 VM's form opens.
+    macos_versions: Option<Result<Vec<reims_util::Version>, String>>,
 }
 
 impl App {
@@ -161,6 +165,8 @@ impl App {
             update_channel: None,
             pending_select: None,
             pending_page: None,
+            pending_view: None,
+            macos_versions: None,
         };
         app.reload()?;
         if !app.rows.is_empty() {
@@ -282,6 +288,9 @@ impl App {
             if let Some((vm, files)) = self.pending_page.take() {
                 self.page(terminal, &vm, &files)?;
             }
+            if let Some(vm) = self.pending_view.take() {
+                self.show_screen(terminal, &vm)?;
+            }
             while let Ok(m) = self.rx.try_recv() {
                 self.message(m);
             }
@@ -307,6 +316,22 @@ impl App {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.open_log(vm, false),
             Err(e) => self.say(&format!("less: {e}"), Level::Error),
         }
+        Ok(())
+    }
+
+    /// Shows a running VM's screen in the terminal (view.rs) until its Control-].
+    fn show_screen(&mut self, terminal: &mut DefaultTerminal, vm: &Vm) -> Result<()> {
+        ratatui::restore();
+        let result = crate::view::run(vm, &crate::view::Options::default());
+        enable_raw_mode()?;
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        terminal.clear()?;
+        match result {
+            Ok(Some(m)) => self.say(&m, Level::Info),
+            Ok(None) => {}
+            Err(e) => self.say(&format!("{}: {e:#}", vm.name()), Level::Error),
+        }
+        let _ = self.reload();
         Ok(())
     }
 
@@ -493,7 +518,8 @@ impl App {
             title: "Quit while work is running?".into(),
             body: format!(
                 "{busy}\n\nQuitting stops this work where it is: a guest asked to shut down still does, \
-                 but is no longer powered off if it does not; a VM being created is left unfinished."
+                 but is no longer powered off if it does not; a VM being created is left unfinished, \
+                 though a download of macOS picks up where it stopped when you create it again."
             ),
             options: vec![("Keep working", Action::None), ("Quit", Action::Quit)],
             choice: 0,
@@ -517,6 +543,7 @@ impl App {
             KeyCode::Char('K') => self.ask_force_stop(),
             KeyCode::Char('e') => self.open_edit(),
             KeyCode::Char('c') => self.show_command(),
+            KeyCode::Char('v') => self.view_screen(),
             KeyCode::Char('l') => self.toggle_logs(),
             KeyCode::Char('L') => self.view_logs(),
             KeyCode::Char('b') => self.report(),
@@ -664,11 +691,23 @@ impl App {
             return;
         };
         let running = self.rows.iter().filter(|r| r.pid.is_some()).count();
-        let note = if running > 0 {
+        let mut note = if running > 0 {
             format!("\n\n{running} VM(s) running keep their current QEMU until they restart.")
         } else {
             String::new()
         };
+        if !self.activity.is_empty() {
+            let busy = self
+                .activity
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            note.push_str(&format!(
+                "\n\nThe restart stops this work where it is, as quitting does (a download of \
+                 macOS picks up where it stopped):\n{busy}"
+            ));
+        }
         let current = update::current_branch(&i.repo)
             .as_deref()
             .and_then(Channel::of);
@@ -765,6 +804,16 @@ impl App {
     }
 
     /// The selected VM's QEMU log, then its serial console, for the run loop to show in less.
+    fn view_screen(&mut self) {
+        let Some(r) = self.selected() else { return };
+        if r.pid.is_none() {
+            let name = r.name.clone();
+            self.say(&format!("{name} is not running: s starts it"), Level::Warn);
+            return;
+        }
+        self.pending_view = self.selected_vm();
+    }
+
     fn view_logs(&mut self) {
         let Some(vm) = self.selected_vm() else { return };
         let files: Vec<PathBuf> = [vm.qemu_log(), vm.serial_log()]
@@ -847,8 +896,62 @@ impl App {
             );
             return;
         };
-        let mut fields = vec![
-            Field::text("name", "Name", "", "Letters, digits, '-', '_' and '.'."),
+        let name = match profile {
+            Profile::Q35X86_64 => Field::text(
+                "name",
+                "Name",
+                "",
+                "Letters, digits, '-', '_' and '.'. Empty names a VM of downloaded macOS after it.",
+            )
+            .placeholder("the macOS version's, such as tahoe"),
+            Profile::VmappleArm64 => {
+                Field::text("name", "Name", "", "Letters, digits, '-', '_' and '.'.")
+            }
+        };
+        let mut fields = vec![name];
+        match profile {
+            Profile::Q35X86_64 => {
+                if !matches!(self.macos_versions, Some(Ok(_))) {
+                    self.macos_versions =
+                        Some(reims_util::versions().map_err(|e| format!("{e:#}")));
+                }
+                let (options, version_help) = match &self.macos_versions {
+                    Some(Ok(list)) if !list.is_empty() => (
+                        list.iter()
+                            .map(|v| (v.slug.clone(), v.name.clone()))
+                            .collect(),
+                        "The macOS to download from Apple. x86-64 macOS 26 is the one we've tested.".to_string(),
+                    ),
+                    Some(Ok(_)) => (opts(&[("", "none")]), "reims-util lists no versions.".to_string()),
+                    Some(Err(e)) => (opts(&[("", "unavailable")]), e.clone()),
+                    None => (opts(&[("", "unavailable")]), String::new()),
+                };
+                let first = options.first().map(|o| o.0.clone()).unwrap_or_default();
+                fields.extend([
+                    Field::choice("source", "macOS from", opts(&[("download", "Download it from Apple"), ("installer", "An installer image of my own"), ("disk", "A disk that has macOS already")]), "download", "reims-ctl downloads the installer, makes the VM's OpenCore image and a new disk, and the VM boots into the installer."),
+                    Field::choice("macos", "macOS version", options, &first, &version_help).show_if("source", &["download"]),
+                    Field::choice("installer_kind", "Installer", opts(&[("online", "Online, about 1 GB"), ("offline", "Offline, 13 to 20 GB")]), "online", "Online is Apple's recovery image: macOS downloads the newest release as it installs. Offline holds one release whole, and installs with no network (macOS 11 and later). Either is kept for the next VM, and a stopped download picks up where it stopped.").show_if("source", &["download"]),
+                    Field::text("release", "Release", "", "Optional: an exact release of that macOS, such as 26.6.2; empty for the newest. reims-util offline-installer list lists them.").placeholder("the newest").show_if("installer_kind", &["offline"]),
+                    Field::path("installer", "Installer image", "", "An installer to boot (Tab completes): a raw image, such as a recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory. Eject it once macOS is installed (e).").show_if("source", &["installer"]),
+                    Field::text("disk_size", "Disk size", "128G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["download", "installer"]),
+                    Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("source", &["disk"]),
+                    Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; in place, the VM writes the image itself.")
+                        .show_if("source", &["disk"]),
+                    Field::path("opencore", "OpenCore image", "", "Empty makes one for this VM, with OVMF and a Mac identity of its own. Or an OpenCore image of yours to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it, such as the one a disk of macOS booted from, which keeps its Mac's identity.")
+                        .placeholder("made for this VM"),
+                ]);
+            }
+            Profile::VmappleArm64 => {
+                fields.extend([
+                    Field::choice("source", "macOS from", opts(&[("ipsw", "Install from an IPSW"), ("import", "Import a Virtualization.framework VM")]), "ipsw", "Install a fresh macOS, or bring a VM made with macosvm or tart."),
+                    Field::path("ipsw", "IPSW", "latest", "An .ipsw restore image (Tab completes), or latest to download the newest this Mac supports (about 15 GB).").show_if("source", &["ipsw"]),
+                    Field::text("disk_size", "Disk size", "64G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["ipsw"]),
+                    Field::path("bundle", "VM directory", "", "macosvm's directory (disk.img, aux.img, vm.json) or tart's (disk.img, nvram.bin, config.json).").show_if("source", &["import"]),
+                    Field::choice("bundle_mode", "Use it by", opts(&[("copy", "Cloning it (instant on the same APFS volume)"), ("in-place", "Using it in place")]), "copy", "A clone leaves the original as it was.").show_if("source", &["import"]),
+                ]);
+            }
+        }
+        fields.extend([
             Field::path(
                 "dir",
                 "Storage directory",
@@ -874,35 +977,9 @@ impl App {
                     format_mib(create::host_memory_mib() / 1024 * 1024)
                 ),
             ),
-        ];
+        ]);
         if profile.gpu_choice(self.host) {
             fields.push(self.gpu_field(&crate::vm::Gpu::default()));
-        }
-        match profile {
-            Profile::Q35X86_64 => {
-                fields.extend([
-                    Field::path("script", "Import a launch script", "", "Optional: an OSX-KVM or ULTMOS boot script (boot.sh, OpenCore-Boot.sh). Its disk, OpenCore image, firmware, installer and CPU fill what you leave empty below.")
-                        .placeholder("optional"),
-                    Field::choice("disk_kind", "Disk", opts(&[("new", "Create a new disk"), ("existing", "Use an existing disk image"), ("script", "The launch script's disk")]), "new", "A new, empty disk to install macOS on, or a disk that has it already."),
-                    Field::text("disk_size", "Disk size", "128G", "The new disk's size; it takes only what the guest writes.").show_if("disk_kind", &["new"]),
-                    Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("disk_kind", &["existing"]),
-                    Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("overlay", "An overlay over it (it must stay)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; an overlay records only the changes; in place, the VM writes the image itself.")
-                        .show_if("disk_kind", &["existing", "script"]),
-                    Field::path("opencore", "OpenCore image", "", "The OpenCore image to copy (OpenCore.qcow2 from OSX-KVM or ULTMOS, with its config.plist). Empty to take the launch script's.")
-                        .placeholder("required unless the launch script names one"),
-                    Field::path("installer", "Installer image", "", "Optional: an installer to boot (an .iso goes in a CD drive; BaseSystem.img as a disk, and BaseSystem.dmg too, converted to a raw image in the VM's directory). Eject it once macOS is installed (e).")
-                        .placeholder("optional"),
-                ]);
-            }
-            Profile::VmappleArm64 => {
-                fields.extend([
-                    Field::choice("source", "macOS from", opts(&[("ipsw", "Install from an IPSW"), ("import", "Import a Virtualization.framework VM")]), "ipsw", "Install a fresh macOS, or bring a VM made with macosvm or tart."),
-                    Field::path("ipsw", "IPSW", "latest", "An .ipsw restore image (Tab completes), or latest to download the newest this Mac supports (about 15 GB).").show_if("source", &["ipsw"]),
-                    Field::text("disk_size", "Disk size", "64G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["ipsw"]),
-                    Field::path("bundle", "VM directory", "", "macosvm's directory (disk.img, aux.img, vm.json) or tart's (disk.img, nvram.bin, config.json).").show_if("source", &["import"]),
-                    Field::choice("bundle_mode", "Use it by", opts(&[("copy", "Cloning it (instant on the same APFS volume)"), ("in-place", "Using it in place")]), "copy", "A clone leaves the original as it was.").show_if("source", &["import"]),
-                ]);
-            }
         }
         fields.extend([
             Field::text(
@@ -1017,30 +1094,16 @@ impl App {
                 "Seconds stop (x) waits for the guest to shut down before it powers the VM off.",
             ),
         ]);
-        if let Some(q) = &c.q35 {
-            let live = if runtime::running(&vm) {
-                " A disc changes at once in the running VM's CD drive."
-            } else {
-                ""
-            };
-            fields.extend([
+        if c.q35.is_some() {
+            fields.push(
                 Field::path(
                     "installer",
                     "Installer image",
                     &installer_shown(&vm),
-                    &format!(
-                        "An .iso (CD), or BaseSystem.img or .dmg (disk; a DMG is converted to a raw image in the VM's directory) (Tab completes). Empty to eject.{live}"
-                    ),
+                    "A raw image, or a DMG, converted to a raw image in the VM's directory (Tab completes). Empty to eject.",
                 )
                 .placeholder("none (ejected)"),
-                Field::text("cpu_model", "CPU model", &q.cpu_model, "QEMU's -cpu model."),
-                Field::text(
-                    "cpu_flags",
-                    "CPU flags",
-                    &q.cpu_flags,
-                    "Flags after the model's.",
-                ),
-            ]);
+            );
         }
         let extra = c
             .extra_args
@@ -1088,8 +1151,15 @@ impl App {
                 let name = spec.name.clone();
                 self.spawn(&name, "creating", move |p| {
                     let vm = create::create(spec, host, p)?;
+                    let next = if runtime::install_steps(&vm).is_some() {
+                        "; its details say how to install macOS"
+                    } else if vm.config.q35.is_some() {
+                        "; set Metal's error mode in its macOS if it isn't (README)"
+                    } else {
+                        ""
+                    };
                     Ok(format!(
-                        "created {} in {} · s starts it",
+                        "created {} in {} · s starts it{next}",
                         vm.name(),
                         paths::tilde(&vm.dir)
                     ))
@@ -1115,8 +1185,7 @@ impl App {
                 };
                 self.say(&format!("{name}: saved{note}"), Level::Ok);
                 self.reload()?;
-                // After the rest is saved: a DMG takes seconds to convert, and a running VM's
-                // CD drive changes at once.
+                // After the rest is saved: a DMG takes seconds to convert.
                 if let Some(path) = installer {
                     self.spawn(name, "changing the installer", move |p| {
                         set_installer(&mut vm, path, p)
@@ -1128,7 +1197,12 @@ impl App {
     }
 
     fn spec_from(&self, f: &Form) -> Result<Spec> {
-        let name = f.text("name");
+        let mut name = f.text("name");
+        if name.is_empty() && f.is_shown("macos") && f.choice("source") == "download" {
+            // Its error first: a version that cannot be had names nothing.
+            self.download_from(f)?;
+            name = self.free_name(&f.choice("macos"));
+        }
         crate::vm::check_name(&name)?;
         if self.rows.iter().any(|r| r.name == name) {
             bail!("a VM named {name} already exists");
@@ -1147,33 +1221,29 @@ impl App {
         };
         match self.host.default_profile() {
             Some(Profile::Q35X86_64) => {
-                s.from_script = opt_path("script");
-                s.disk = match f.choice("disk_kind").as_str() {
-                    "new" => Some(DiskSource::New {
+                let size = || -> Result<DiskSource> {
+                    Ok(DiskSource::New {
                         size_mib: parse_size_mib(&f.text("disk_size")).context("disk size")?,
-                    }),
-                    "existing" => Some(DiskSource::Existing {
-                        path: opt_path("disk_path").context("give the disk image's path")?,
-                        mode: ImportMode::parse(&f.choice("disk_mode"))?,
-                    }),
-                    _ => {
-                        let script = s
-                            .from_script
-                            .clone()
-                            .context("the launch script's disk: give the launch script")?;
-                        let parsed = create::LaunchScript::read(&script)?;
-                        let path = parsed.disk.context("the launch script names no disk")?;
-                        Some(DiskSource::Existing {
-                            path,
-                            mode: ImportMode::parse(&f.choice("disk_mode"))?,
-                        })
-                    }
+                    })
                 };
-                s.opencore = opt_path("opencore");
-                if s.opencore.is_none() && s.from_script.is_none() {
-                    bail!("give the OpenCore image, or a launch script that names one");
+                match f.choice("source").as_str() {
+                    "download" => {
+                        s.macos = Some(self.download_from(f)?);
+                        s.disk = Some(size()?);
+                    }
+                    "installer" => {
+                        s.installer =
+                            Some(opt_path("installer").context("give the installer image")?);
+                        s.disk = Some(size()?);
+                    }
+                    _ => {
+                        s.disk = Some(DiskSource::Existing {
+                            path: opt_path("disk_path").context("give the disk image's path")?,
+                            mode: ImportMode::parse(&f.choice("disk_mode"))?,
+                        });
+                    }
                 }
-                s.installer = opt_path("installer");
+                s.opencore = opt_path("opencore");
             }
             Some(Profile::VmappleArm64) => {
                 if f.choice("source") == "ipsw" {
@@ -1208,6 +1278,68 @@ impl App {
             Some(ssh.parse().context("SSH port: a number")?)
         };
         Ok(s)
+    }
+
+    /// `base`, or `base-2`, `base-3`… where a VM has the name, or its default directory holds
+    /// files (a VM deleted with its files kept, or one whose create stopped).
+    fn free_name(&self, base: &str) -> String {
+        let taken = |n: &str| {
+            self.rows.iter().any(|r| r.name == n)
+                || self.activity.contains_key(n)
+                || std::fs::read_dir(create::default_dir(n)).is_ok_and(|mut d| d.next().is_some())
+        };
+        (1..)
+            .map(|i| {
+                if i == 1 {
+                    base.to_string()
+                } else {
+                    format!("{base}-{i}")
+                }
+            })
+            .find(|n| !taken(n))
+            .unwrap_or_default()
+    }
+
+    /// The download the form asks for: its version, and an offline installer's release.
+    fn download_from(&self, f: &Form) -> Result<reims_util::Download> {
+        let slug = f.choice("macos");
+        let version = match &self.macos_versions {
+            Some(Ok(list)) => list.iter().find(|v| v.slug == slug),
+            Some(Err(e)) => bail!("{e}"),
+            None => None,
+        }
+        .context("choose the macOS version")?;
+        let offline = f.choice("installer_kind") == "offline";
+        if !offline {
+            return Ok(reims_util::Download {
+                version: slug,
+                offline,
+            });
+        }
+        if !version.has_offline() {
+            bail!(
+                "{} has no offline installer (macOS 11 and later do): choose Online",
+                version.name
+            );
+        }
+        let release = f.text("release");
+        if release.is_empty() {
+            return Ok(reims_util::Download {
+                version: slug,
+                offline,
+            });
+        }
+        if release.split('.').next() != Some(version.number()) {
+            bail!(
+                "Release: a release of {}, such as {}.1, or empty for the newest",
+                version.name,
+                version.number()
+            );
+        }
+        Ok(reims_util::Download {
+            version: release,
+            offline,
+        })
     }
 
     // ------------------------------------------------------------ drawing
@@ -1378,8 +1510,24 @@ impl App {
                             ])
                         })
                         .collect();
-                    // Below its settings, what starting it warns of on this host.
-                    for w in runtime::warnings(vm, self.host) {
+                    if r.pid.is_some() {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled(
+                            "v shows its screen here, in the terminal",
+                            Style::new().dim(),
+                        )));
+                    }
+                    if let Some(steps) = runtime::install_steps(vm) {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(steps));
+                    }
+                    // Below its settings, what in them its guest does not work with, then
+                    // what starting it warns of on this host.
+                    let incompatible = vm.config.incompatibilities();
+                    for w in incompatible
+                        .into_iter()
+                        .chain(runtime::warnings(vm, self.host))
+                    {
                         lines.push(Line::from(""));
                         lines.push(Line::from(Span::styled(w, Style::new().fg(Color::Yellow))));
                     }
@@ -1575,10 +1723,6 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
         .text("stop_timeout")
         .parse()
         .context("shutdown timeout: seconds")?;
-    if let Some(q) = &mut c.q35 {
-        q.cpu_model = f.text("cpu_model");
-        q.cpu_flags = f.text("cpu_flags");
-    }
     c.extra_args =
         shlex::split(&f.text("extra_args")).context("extra QEMU args: unbalanced quotes")?;
     c.extra_env.clear();
@@ -1654,16 +1798,20 @@ const HELP: &str = "\
 reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in windows of their own.
 
   ↑ ↓ / j k   choose a VM
-  n           create a VM
+  n           create a VM. On Linux, choose a macOS version: reims-ctl downloads its
+              installer from Apple and makes the VM's OpenCore image and disk, and the VM
+              boots into the installer; its details then say how to install macOS
   s / Enter   start it
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)
   K           kill it: power it off at once
   e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
               GPU, audio, network, logs, extra QEMU arguments (they apply at its next start),
-              and its installer image (x86-64), a CD of which changes at once in a running VM
+              and its installer image (x86-64)
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
+  v           show a running VM's screen here, in the terminal, and use its keyboard and
+              mouse from here: for a host with no screen, over SSH too. Ctrl-] comes back
   l           turn its logs on or off
   L           view its QEMU log in less: :n shows the serial console, / searches,
               F follows the log as it grows, q comes back

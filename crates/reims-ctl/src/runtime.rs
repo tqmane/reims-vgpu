@@ -12,7 +12,7 @@
 use crate::host::{Host, Os, Profile};
 use crate::qemu::{self, Ctx, Invocation};
 use crate::qmp;
-use crate::vm::{MediaKind, Vm};
+use crate::vm::Vm;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -117,8 +117,15 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
             need(&vm.path(&q.opencore), "the OpenCore image")?;
             need(&vm.path(&q.firmware_code), "the firmware")?;
             need(&vm.path(&q.firmware_vars), "the firmware variables")?;
-            if let Some(i) = &q.installer {
-                need(&vm.path(i), "the installer")?;
+            if let Some(i) = q.installer.as_ref().map(|i| vm.path(i))
+                && !i.exists()
+            {
+                bail!(
+                    "the installer {} is missing: reims-ctl eject {} takes it out (in the \
+                     interface, clear Installer image in its edit form, e)",
+                    i.display(),
+                    c.name
+                );
             }
         }
         Profile::VmappleArm64 => {
@@ -145,27 +152,154 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
     Ok(())
 }
 
-/// Warnings about the host for a start that would still work.
+/// The reminder where an x86-64 VM's macOS gets installed.
+pub const SET_METAL_ERROR_MODE: &str = "set Metal's error mode once macOS is installed (README)";
+
+/// The host's `vm.max_map_count` (Linux).
+pub fn host_max_map_count() -> Option<u64> {
+    std::fs::read_to_string("/proc/sys/vm/max_map_count")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// The `vm.max_map_count` a guest of `memory_mib` needs on Linux, and the value to suggest
+/// raising it to. docs/qemu.md, "Linux hosts: vm.max_map_count": guest memory views take a
+/// mapping per run of 16 KiB pages; the stock 65,530 holds about 770 MiB of them.
+pub fn max_map_count(memory_mib: u64) -> (u64, u64) {
+    let want = (memory_mib * 64).max(262_144) + 16_384 + 65_536;
+    // 2097152 covers a guest of up to 30 GiB, a new VM's default of up to 16 GiB among them.
+    (want, want.next_power_of_two().max(2_097_152))
+}
+
+/// How to install macOS in an x86-64 VM that has an installer, for the CLI and the interface's
+/// details; None for other VMs. An offline installer, which reims-util names
+/// `…-offline-installer.img`, installs from its script; any other installer boots Recovery,
+/// whose Reinstall macOS installs it.
+pub fn install_steps(vm: &Vm) -> Option<String> {
+    let q = vm.config.q35.as_ref()?;
+    let installer = q.installer.as_ref()?;
+    let offline = installer
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().ends_with("-offline-installer.img"));
+    let last = if offline {
+        "open Utilities > Terminal and run: sh /Volumes/Installer/install-macos.sh"
+    } else {
+        "pick Reinstall macOS"
+    };
+    Some(format!(
+        "To install macOS, start {name}: OpenCore boots its installer into macOS Recovery. If the \
+         VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as APFS and quit \
+         Disk Utility. Then {last}. Once macOS is installed, eject the installer (reims-ctl \
+         eject {name}) and set Metal's error mode (README).",
+        name = vm.name()
+    ))
+}
+
+/// Warnings about the host, or the guest's last boot, for a start that would still work.
 pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
     let mut w = Vec::new();
+    if vm.config.profile == Profile::Q35X86_64 {
+        // docs/qemu.md, "x86-64 macOS guests: Metal's error mode": without it, macOS 26's icon
+        // service ends as it starts, again and again, and the library logs each command it left
+        // queued. From Recovery, the `cd` expands the Data volume's name, and `defaults` leaves
+        // the file at mode 0600, which the user's processes cannot read.
+        let n = emptied_entry_lines(&vm.qemu_log());
+        if n >= 3 {
+            w.push(format!(
+                "QEMU's latest log has {n} lines on GPU work left by crashed macOS processes. On \
+                 x86-64 macOS 26 that's most likely its icon service, crashing because Metal's \
+                 error mode isn't set, and the desktop can stay on its wallpaper. To set it, boot \
+                 Recovery from OpenCore's picker, open Utilities > Terminal and run: cd \
+                 /Volumes/*Data/Library/Preferences && defaults write \"$PWD/.GlobalPreferences\" \
+                 METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot"
+            ));
+        }
+    }
     if host.os == Os::Linux {
-        // docs/qemu.md, "Linux hosts: vm.max_map_count": guest memory views take a mapping per
-        // run of 16 KiB pages; the stock 65,530 holds about 770 MiB of them.
-        if let Some(n) = std::fs::read_to_string("/proc/sys/vm/max_map_count")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-        {
-            let want = (vm.config.memory_mib * 64).max(262_144) + 16_384 + 65_536;
+        if let Some(n) = host_max_map_count() {
+            let (want, raise) = max_map_count(vm.config.memory_mib);
             if n < want {
                 w.push(format!(
                     "vm.max_map_count is {n}: a {} GiB guest needs about {want}. Raise it with \
-                     sudo sysctl -w vm.max_map_count=1048576 (and in /etc/sysctl.d to keep it)",
+                     sudo sysctl -w vm.max_map_count={raise} (and in /etc/sysctl.d to keep it)",
                     vm.config.memory_mib / 1024
+                ));
+            }
+        }
+        // docs/qemu.md, "Linux hosts: AMD GPUs and udmabuf": RADV imports the guest's memory as
+        // dma-bufs udmabuf makes.
+        if may_run_on_radv(&vm.config.gpu) {
+            let usable = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/udmabuf");
+            if let Err(e) = usable {
+                w.push(format!(
+                    "/dev/udmabuf cannot be opened ({e}): an AMD GPU needs it for the guest's \
+                     memory, or the guest dies at boot. Add yourself to the group that owns it \
+                     (kvm on Ubuntu; sudo usermod -aG kvm $USER, then log in again)"
                 ));
             }
         }
     }
     w
+}
+
+/// Whether a VM may run on RADV, Mesa's driver for AMD GPUs: its GPU is one, or none is set and
+/// the host has an AMD GPU and no NVIDIA one, which the library would pick first as discrete.
+fn may_run_on_radv(gpu: &crate::vm::Gpu) -> bool {
+    let radv = |file: &Path| {
+        file.file_name()
+            .is_some_and(|f| f.to_string_lossy().starts_with("radeon_icd"))
+    };
+    match &gpu.driver_file {
+        Some(file) => radv(file) || gpu.name.as_deref().is_some_and(|n| n.contains("RADV")),
+        None => {
+            let vendors: Vec<String> = std::fs::read_dir("/sys/class/drm")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|card| std::fs::read_to_string(card.path().join("device/vendor")).ok())
+                .map(|v| v.trim().to_owned())
+                .collect();
+            vendors.iter().any(|v| v == "0x1002") && !vendors.iter().any(|v| v == "0x10de")
+        }
+    }
+}
+
+/// How many lines of a QEMU log, since the guest's last reset, name an object entry the guest
+/// had emptied: the library logs them at its warn level when a command of a guest process that
+/// has ended runs, and `device reset` at its info level. The TUI asks at every draw, so the count
+/// carries on from the bytes already read while the file is the same (by inode) and has not
+/// shrunk.
+fn emptied_entry_lines(log: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    const EMPTIED: &[u8] = b"has an empty entry";
+    static READ: std::sync::Mutex<(std::path::PathBuf, u64, u64, usize)> =
+        std::sync::Mutex::new((std::path::PathBuf::new(), 0, 0, 0));
+    let Ok(mut f) = std::fs::File::open(log) else {
+        return 0;
+    };
+    let Ok(meta) = f.metadata() else { return 0 };
+    let mut r = READ.lock().unwrap_or_else(|e| e.into_inner());
+    if r.0 != log || r.1 != meta.ino() || r.2 > meta.len() {
+        *r = (log.to_path_buf(), meta.ino(), 0, 0);
+    }
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(r.2)).is_ok() {
+        let _ = f.take(meta.len() - r.2).read_to_end(&mut buf);
+    }
+    // Whole lines only: the rest is read again once its line ends.
+    let end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    for l in buf[..end].split(|&b| b == b'\n') {
+        if l.ends_with(b"device reset") {
+            r.3 = 0;
+        } else if l.windows(EMPTIED.len()).any(|w| w == EMPTIED) {
+            r.3 += 1;
+        }
+    }
+    r.2 += end as u64;
+    r.3
 }
 
 /// Keeps the last five of a log: `x.log` becomes `x.1.log`, and so on.
@@ -417,34 +551,6 @@ fn wait_gone(p: i32, t: Duration) -> bool {
     !alive(p)
 }
 
-/// Puts `path` in the running VM's CD drive, or empties it (`None`).
-pub fn change_cd(vm: &Vm, path: Option<&Path>) -> Result<()> {
-    let q = vm
-        .config
-        .q35
-        .as_ref()
-        .context("only q35 VMs have a CD drive")?;
-    if q.installer_kind == Some(MediaKind::Disk) && q.installer.is_some() {
-        bail!("the installer is attached as a disk, which changes at the next start");
-    }
-    let sock = vm.qmp_socket();
-    match path {
-        Some(p) => qmp::run(
-            &sock,
-            "blockdev-change-medium",
-            Some(
-                json!({ "id": "cdrom", "filename": p.to_string_lossy(), "format": "raw", "read-only-mode": "read-only" }),
-            ),
-        )?,
-        None => qmp::run(
-            &sock,
-            "eject",
-            Some(json!({ "id": "cdrom", "force": true })),
-        )?,
-    };
-    Ok(())
-}
-
 /// The last `n` lines of a text file.
 pub fn tail(path: &Path, n: usize) -> String {
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -458,4 +564,84 @@ pub fn tail(path: &Path, n: usize) -> String {
     let text = String::from_utf8_lossy(&buf);
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::Gpu;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_suggested_max_map_count_covers_new_vms() {
+        // A new VM's default is up to 16 GiB; CachyOS's stock 1048576 falls short of it.
+        assert_eq!(max_map_count(16 * 1024), (1_130_496, 2_097_152));
+        assert_eq!(max_map_count(4096), (344_064, 2_097_152));
+        let (want, raise) = max_map_count(30 * 1024);
+        assert!(want <= raise && raise == 2_097_152);
+        assert_eq!(max_map_count(32 * 1024).1, 4_194_304);
+    }
+
+    /// A VM pinned to Mesa's radeon driver, or to a GPU named RADV, may run on RADV; one pinned
+    /// to NVIDIA's may not
+    #[test]
+    fn a_pinned_gpu_decides_radv() {
+        let gpu = |file: &str, name: &str| Gpu {
+            driver_file: Some(PathBuf::from(file)),
+            device_id: None,
+            name: Some(name.to_owned()),
+        };
+        assert!(may_run_on_radv(&gpu(
+            "/usr/share/vulkan/icd.d/radeon_icd.json",
+            "AMD Radeon 780M Graphics (RADV PHOENIX)"
+        )));
+        assert!(may_run_on_radv(&gpu(
+            "/usr/share/vulkan/icd.d/radeon_icd.x86_64.json",
+            "AMD Radeon 780M Graphics"
+        )));
+        assert!(!may_run_on_radv(&gpu(
+            "/usr/share/vulkan/icd.d/nvidia_icd.json",
+            "NVIDIA GeForce RTX 3090"
+        )));
+    }
+
+    #[test]
+    fn emptied_entry_lines_count_on_from_what_was_read() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-emptied-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let log = d.join("qemu.log");
+        let fault = "reims-vgpu WARN reims_vgpu_core::tasks::local::exec: task 2: exec faulted: \
+                     resource 3 not found: object 3 has an empty entry\n";
+        let append = |s: &str| {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .unwrap();
+            f.write_all(s.as_bytes()).unwrap();
+        };
+        assert_eq!(emptied_entry_lines(&log), 0);
+        append("reims-ctl 0.1.0 started t\n");
+        append(fault);
+        assert_eq!(emptied_entry_lines(&log), 1);
+        // A line still being written counts once it ends.
+        append(&fault[..40]);
+        assert_eq!(emptied_entry_lines(&log), 1);
+        append(&fault[40..]);
+        append(fault);
+        assert_eq!(emptied_entry_lines(&log), 3);
+        // The guest's reboot in the same run (as after setting the key from Recovery) counts
+        // from the device's reset.
+        append("reims-vgpu INFO reims_vgpu_core::device::lifecycle: device reset\n");
+        assert_eq!(emptied_entry_lines(&log), 0);
+        append(fault);
+        assert_eq!(emptied_entry_lines(&log), 1);
+        // A start's rotation leaves a new file, counted from its start.
+        std::fs::rename(&log, d.join("qemu.1.log")).unwrap();
+        append(&"x".repeat(4096));
+        append("\n");
+        append(fault);
+        assert_eq!(emptied_entry_lines(&log), 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }

@@ -3,7 +3,7 @@
 use crate::create::{self, DiskSource, ImportMode, Spec};
 use crate::host::{Host, Profile};
 use crate::vm::{self, Registry, Vm, format_mib, parse_size_mib};
-use crate::{gpu, install, logs, paths, qemu, runtime, update};
+use crate::{gpu, install, logs, paths, qemu, reims_util, runtime, update, view};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
@@ -63,6 +63,20 @@ pub enum Cmd {
     Show { name: String },
     /// Change a VM's settings (they apply at its next start)
     Set(Box<SetArgs>),
+    /// Show a running VM's screen in this terminal, and use its keyboard and mouse from here
+    #[command(after_help = VIEW_HELP)]
+    View {
+        name: String,
+        /// The display to show, from 1
+        #[arg(long, default_value_t = 1)]
+        display: u32,
+        /// The most frames a second
+        #[arg(long, default_value_t = 15)]
+        fps: u32,
+        /// How to draw the screen (by default, the best the terminal answers it can show)
+        #[arg(long, value_enum)]
+        protocol: Option<view::Protocol>,
+    },
     /// Print the QEMU command that runs a VM, as a shell script
     Command {
         name: String,
@@ -70,8 +84,8 @@ pub enum Cmd {
         #[arg(long, short)]
         output: Option<PathBuf>,
     },
-    /// Put an installer image in a VM (x86-64), into the running VM's CD drive where it can; a
-    /// DMG is converted to a raw image in the VM's directory
+    /// Give a VM (x86-64) an installer image for its next start; a DMG is converted to a raw
+    /// image in the VM's directory
     Insert { name: String, path: PathBuf },
     /// Take the installer out of a VM (x86-64)
     Eject { name: String },
@@ -127,6 +141,15 @@ pub enum Cmd {
     },
 }
 
+const VIEW_HELP: &str = "\
+For a VM on a host with no screen, to set macOS up before it has screen sharing or remote \
+login. The screen is drawn with the terminal's graphics (kitty's, iTerm2's or sixel; half-block \
+characters where it has none), over SSH as well, and the terminal's keys, mouse and pasted text \
+go to the guest as a US keyboard's and a tablet's.
+
+Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
+buttons on the top row hold that key for the next key or click.";
+
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
     clap::Arg::new("x")
@@ -146,21 +169,22 @@ fn with_create_examples(e: impl std::fmt::Display) -> anyhow::Error {
 }
 
 const CREATE_EXAMPLES: &str = r"
-  An x86-64 guest on Linux, with OpenCore from OSX-KVM:
+  An x86-64 guest on Linux:
 
-    # A disk that already has macOS installed (copied; see --disk-mode)
-    reims-ctl create mac --opencore ~/OSX-KVM/OpenCore/OpenCore.qcow2 \
-      --disk ~/OSX-KVM/mac_hdd_ng.img
+    # Download macOS Tahoe from Apple, make the VM's OpenCore image and a new
+    # 128G disk, and start it: the installer boots into macOS Recovery. Once
+    # macOS is installed, reims-ctl eject mac takes the installer out
+    reims-ctl create mac --macos tahoe --start
 
-    # A new 128G disk and the macOS installer (the recovery image as downloaded, or
-    # converted to BaseSystem.img); once macOS is installed, reims-ctl eject mac
-    # takes the installer out
-    reims-ctl create mac --opencore ~/OSX-KVM/OpenCore/OpenCore.qcow2 \
-      --installer ~/OSX-KVM/BaseSystem.dmg --start
+    # One exact release, which installs with no network (13 to 20 GB)
+    reims-ctl create mac --macos 26.6.2 --offline --start
 
-    # Everything an OSX-KVM or ULTMOS launch script names: its disk (copied),
-    # OpenCore, firmware, installer, CPU and MAC
-    reims-ctl create mac --from-script ~/OSX-KVM/OpenCore-Boot.sh
+    # An installer of your own, such as a recovery image (BaseSystem.dmg)
+    reims-ctl create mac --installer ~/Downloads/BaseSystem.dmg
+
+    # A disk that already has macOS installed (copied; see --disk-mode), with
+    # the OpenCore image it booted from, which keeps its Mac's identity
+    reims-ctl create mac --disk ~/vms/mac.qcow2 --opencore ~/vms/OpenCore.qcow2
 
   An arm64 guest on an Apple silicon Mac:
 
@@ -193,32 +217,26 @@ pub struct CreateArgs {
     /// An existing disk image
     #[arg(long, conflicts_with = "disk_size")]
     pub disk: Option<PathBuf>,
-    /// How an existing disk is used: copy (a reflink or clone where it can), overlay, in-place
+    /// How an existing disk is used: copy (a reflink or clone where it can) or in-place
     #[arg(long, default_value = "copy")]
     pub disk_mode: String,
-    /// x86-64: the OpenCore image to copy (OpenCore.qcow2, from OSX-KVM or ULTMOS)
+    /// x86-64: download this macOS from Apple to install: a name (tahoe), a number (26) or
+    /// latest; with --offline, also a release (26.6.2) or a build (25G83)
+    #[arg(long, value_name = "VERSION", conflicts_with = "installer")]
+    pub macos: Option<String>,
+    /// x86-64: with --macos, an offline installer of one release (13 to 20 GB), which installs
+    /// with no network, rather than Apple's recovery image (about 1 GB), which downloads the
+    /// newest release as it installs
+    #[arg(long, requires = "macos")]
+    pub offline: bool,
+    /// x86-64: an installer image of your own, attached as a disk: a raw image, such as a
+    /// recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory
+    #[arg(long)]
+    pub installer: Option<PathBuf>,
+    /// x86-64: an OpenCore image of your own to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside
+    /// it (default: a new one made for the VM, with OVMF and a Mac identity of its own)
     #[arg(long)]
     pub opencore: Option<PathBuf>,
-    /// x86-64: the installer image (an .iso goes in a CD drive; BaseSystem.img as a disk, and
-    /// BaseSystem.dmg too, converted to a raw image in the VM's directory)
-    #[arg(long, alias = "iso", alias = "cdrom")]
-    pub installer: Option<PathBuf>,
-    /// x86-64: take the disk, OpenCore, firmware, installer, CPU and MAC from an OSX-KVM or
-    /// ULTMOS launch script
-    #[arg(long)]
-    pub from_script: Option<PathBuf>,
-    /// x86-64: OVMF's code (default: found beside the OpenCore image, or QEMU's own)
-    #[arg(long)]
-    pub firmware_code: Option<PathBuf>,
-    /// x86-64: OVMF's variables
-    #[arg(long)]
-    pub firmware_vars: Option<PathBuf>,
-    /// x86-64: QEMU's CPU model (default Haswell-noTSX)
-    #[arg(long)]
-    pub cpu_model: Option<String>,
-    /// x86-64: CPU flags after the model's
-    #[arg(long)]
-    pub cpu_flags: Option<String>,
     /// The network card's MAC
     #[arg(long)]
     pub mac: Option<String>,
@@ -309,10 +327,6 @@ pub struct SetArgs {
     /// Seconds stop waits for the guest before it powers the VM off
     #[arg(long)]
     pub stop_timeout: Option<u64>,
-    #[arg(long)]
-    pub cpu_model: Option<String>,
-    #[arg(long)]
-    pub cpu_flags: Option<String>,
     /// More QEMU arguments, as one shell-quoted string; empty for none
     #[arg(long, allow_hyphen_values = true)]
     pub extra_args: Option<String>,
@@ -354,6 +368,22 @@ pub fn main(cli: Cli) -> Result<i32> {
         }
         Cmd::Show { name } => show(&Registry::load()?.open(&name)?, host),
         Cmd::Set(a) => set(*a, host)?,
+        Cmd::View {
+            name,
+            display,
+            fps,
+            protocol,
+        } => {
+            let vm = Registry::load()?.open(&name)?;
+            let opts = view::Options {
+                display,
+                fps,
+                protocol,
+            };
+            if let Some(m) = view::run(&vm, &opts)? {
+                println!("{m}");
+            }
+        }
         Cmd::Command { name, output } => {
             let vm = Registry::load()?.open(&name)?;
             let script =
@@ -421,12 +451,17 @@ pub fn main(cli: Cli) -> Result<i32> {
         Cmd::VzLatest => return crate::vz::latest_main(),
         Cmd::RecordInstall { repo, qemu, commit } => {
             install::Install {
-                repo,
+                repo: repo.clone(),
                 commit,
                 qemu,
                 installed_at: runtime::now_stamp("%Y-%m-%d %H:%M:%S %z"),
             }
             .save()?;
+            // What makes a new x86-64 VM's OpenCore image and installer (reims_util.rs).
+            if host.default_profile() == Some(Profile::Q35X86_64) {
+                println!("==> Installing reims-util (cargo install)");
+                reims_util::install(&repo)?;
+            }
         }
     }
     let _ = bool_arg;
@@ -531,8 +566,12 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         .or(a.name_pos.clone())
         .ok_or_else(|| with_create_examples("give the VM a name: reims-ctl create NAME"))?;
     // Nothing a VM is made from: whatever create says is missing, the examples show the ways.
-    let source =
-        a.opencore.is_some() || a.from_script.is_some() || a.ipsw.is_some() || a.bundle.is_some();
+    let source = a.macos.is_some()
+        || a.installer.is_some()
+        || a.disk.is_some()
+        || a.opencore.is_some()
+        || a.ipsw.is_some()
+        || a.bundle.is_some();
     let mut s = Spec::new(&name);
     s.dir = a
         .dir
@@ -548,7 +587,7 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
             path: paths::absolute(&p.to_string_lossy()),
             mode: ImportMode::parse(&a.disk_mode)?,
         }),
-        (None, None) if a.from_script.is_none() && a.bundle.is_none() => Some(DiskSource::New {
+        (None, None) if a.bundle.is_none() => Some(DiskSource::New {
             size_mib: if a.ipsw.is_some() {
                 64 * 1024
             } else {
@@ -558,13 +597,12 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         _ => None,
     };
     let abs = |p: &Option<PathBuf>| p.as_ref().map(|p| paths::absolute(&p.to_string_lossy()));
+    s.macos = a.macos.clone().map(|version| reims_util::Download {
+        version,
+        offline: a.offline,
+    });
     s.opencore = abs(&a.opencore);
     s.installer = abs(&a.installer);
-    s.from_script = abs(&a.from_script);
-    s.firmware_code = abs(&a.firmware_code);
-    s.firmware_vars = abs(&a.firmware_vars);
-    s.cpu_model = a.cpu_model.clone();
-    s.cpu_flags = a.cpu_flags.clone();
     s.mac = a.mac.clone();
     s.ipsw = a.ipsw.clone().map(|i| {
         if i == "latest" {
@@ -600,6 +638,11 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         }
     })?;
     println!("created {name} in {}", paths::tilde(&vm.dir));
+    if let Some(steps) = runtime::install_steps(&vm) {
+        println!("{steps}");
+    } else if vm.config.q35.is_some() {
+        println!("{name}: {}", runtime::SET_METAL_ERROR_MODE);
+    }
     if a.start {
         let pid = runtime::start(&vm, host)?;
         println!("{name}: running, pid {pid}");
@@ -718,15 +761,7 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
         add(
             "installer",
             match &q.installer {
-                Some(i) => format!(
-                    "{} ({})",
-                    paths::tilde(&vm.path(i)),
-                    if q.installer_kind == Some(vm::MediaKind::Disk) {
-                        "disk"
-                    } else {
-                        "CD"
-                    }
-                ),
+                Some(i) => paths::tilde(&vm.path(i)),
                 None => "none".into(),
             },
         );
@@ -786,9 +821,9 @@ fn show(vm: &Vm, host: Host) {
     }
 }
 
-/// Sets the installer, and changes the running VM's disc where it can. Returns what happened.
-/// A DMG is converted into the VM's directory first (`create::installer_media`), and the VM's
-/// copy of the installer it replaces is deleted.
+/// Sets the installer, for the VM's next start. Returns what happened. A DMG is converted into
+/// the VM's directory first (`create::installer_media`), and the VM's copy of the installer it
+/// replaces is deleted.
 pub fn set_installer(
     vm: &mut Vm,
     path: Option<PathBuf>,
@@ -803,9 +838,6 @@ pub fn set_installer(
         .as_mut()
         .context("only x86-64 VMs take installer media")?;
     let old = q.installer.clone();
-    let old_kind = old
-        .as_ref()
-        .map(|_| q.installer_kind.unwrap_or(vm::MediaKind::Cdrom));
     if let Some(p) = &path
         && !p.is_file()
     {
@@ -821,32 +853,25 @@ pub fn set_installer(
         Some(p) => Some(create::installer_media(p, &dir, progress)?),
         None => None,
     };
-    let new_kind = installer.as_deref().map(vm::MediaKind::for_path);
     q.installer = installer.clone();
-    q.installer_kind = new_kind;
     vm.save()?;
     if let Some(c) = &copy
         && installer != old
     {
         let _ = std::fs::remove_file(c);
     }
-    if !running {
-        return Ok(match &path {
-            Some(p) => format!("{name}: {} attached for the next start", paths::tilde(p)),
-            None => format!("{name}: installer removed"),
-        });
-    }
-    // Live: only a CD drive's disc changes; a disk installer changes at the next start.
-    let live = old_kind != Some(vm::MediaKind::Disk) && new_kind != Some(vm::MediaKind::Disk);
-    if live {
-        runtime::change_cd(vm, path.as_deref())?;
-        Ok(match &path {
-            Some(p) => format!("{name}: {} is in the CD drive", paths::tilde(p)),
-            None => format!("{name}: CD ejected"),
-        })
-    } else {
-        Ok(format!("{name}: the installer changes at the next start"))
-    }
+    Ok(match (&path, running) {
+        (Some(p), false) => format!("{name}: {} attached for the next start", paths::tilde(p)),
+        (Some(_), true) => format!("{name}: the installer changes at the next start"),
+        (None, false) => format!(
+            "{name}: installer removed; {}",
+            runtime::SET_METAL_ERROR_MODE
+        ),
+        (None, true) => format!(
+            "{name}: the installer goes at the next start; {}",
+            runtime::SET_METAL_ERROR_MODE
+        ),
+    })
 }
 
 /// Whether `a` and `b` name the same existing file.
@@ -907,18 +932,6 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(t) = a.stop_timeout {
         c.stop_timeout_secs = t;
-    }
-    if a.cpu_model.is_some() || a.cpu_flags.is_some() {
-        let q = c
-            .q35
-            .as_mut()
-            .context("--cpu-model and --cpu-flags are x86-64 settings")?;
-        if let Some(m) = &a.cpu_model {
-            q.cpu_model = m.clone();
-        }
-        if let Some(f) = &a.cpu_flags {
-            q.cpu_flags = f.clone();
-        }
     }
     if let Some(x) = &a.extra_args {
         c.extra_args = shlex::split(x).context("--extra-args: unbalanced quotes")?;
@@ -1059,18 +1072,30 @@ fn doctor(host: Host) -> Result<i32> {
                     ),
                 },
             );
-            if let Some(n) = std::fs::read_to_string("/proc/sys/vm/max_map_count")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-            {
+            if let Some(n) = runtime::host_max_map_count() {
+                // Enough for the largest VM, or a new one.
+                let memory_mib = Registry::load()
+                    .map(|reg| {
+                        reg.vms
+                            .iter()
+                            .filter_map(|e| Vm::load(&e.dir).ok())
+                            .map(|vm| vm.config.memory_mib)
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0)
+                    .max(create::default_memory_mib());
+                let (want, raise) = runtime::max_map_count(memory_mib);
                 line(
-                    n >= 1_048_576,
+                    n >= want,
                     "vm.max_map_count",
-                    if n >= 1_048_576 {
+                    if n >= want {
                         n.to_string()
                     } else {
                         format!(
-                            "{n}: sudo sysctl -w vm.max_map_count=1048576 (a 12 GiB guest needs about that)"
+                            "{n}: a {} GiB guest needs about {want}: sudo sysctl -w \
+                             vm.max_map_count={raise}, and a file in /etc/sysctl.d to keep it",
+                            memory_mib / 1024
                         )
                     },
                 );
@@ -1119,18 +1144,24 @@ fn doctor(host: Host) -> Result<i32> {
         crate::host::Os::Other => {}
     }
     if profile == Profile::Q35X86_64 {
-        // An OpenCore folder can bring its own; this is what a VM without one boots.
-        let fw = create::find_firmware(std::path::Path::new(""));
-        line(
-            fw.is_some(),
-            "OVMF firmware",
-            match fw {
-                Some((code, _)) => code.display().to_string(),
-                None => "not found: install your system's OVMF package (Ubuntu's ovmf, Arch's \
-                         edk2-ovmf), or use an OpenCore folder that carries OVMF"
-                    .into(),
-            },
-        );
+        // What makes a new VM's OpenCore image, with its OVMF, and downloads its installer.
+        match reims_util::binary() {
+            Ok(b) => {
+                let v = reims_util::version(&b);
+                line(
+                    v.is_some(),
+                    "reims-util",
+                    match v {
+                        Some(v) => format!("{} ({v})", b.display()),
+                        None => format!(
+                            "{} does not run: reinstall it with reims-ctl update",
+                            b.display()
+                        ),
+                    },
+                );
+            }
+            Err(e) => line(false, "reims-util", format!("{e:#}")),
+        }
     }
     Ok(if bad == 0 { 0 } else { 1 })
 }
@@ -1154,7 +1185,6 @@ mod tests {
             firmware_code = "OVMF_CODE.fd"
             firmware_vars = "OVMF_VARS.fd"
             installer = "installer.img"
-            installer_kind = "disk"
         "#;
         let mut vm = Vm {
             dir: d.join("vm"),

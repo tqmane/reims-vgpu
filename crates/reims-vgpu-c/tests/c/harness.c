@@ -19,15 +19,18 @@
 
 #include "reims_vgpu.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <pthread.h>
-#include <sched.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <time.h>
-#include <unistd.h>
 
 static int failures;
 
@@ -55,7 +58,11 @@ static _Atomic int display_destroyed;
 static _Atomic int iosurface_destroyed;
 static _Atomic int log_lines;
 static _Atomic int display_calls_on_main;
+#ifdef _WIN32
+static DWORD main_thread;
+#else
 static pthread_t main_thread;
+#endif
 
 static void on_host_destroy(void *ctx) {
     CHECK(ctx == &host_destroyed);
@@ -92,7 +99,11 @@ static void *on_add_trace(void *ctx, RvgPhysicalMemoryRange range, RvgTraceRange
 }
 
 static void on_display_call(void) {
+#ifdef _WIN32
+    if (GetCurrentThreadId() == main_thread) {
+#else
     if (pthread_equal(pthread_self(), main_thread)) {
+#endif
         display_calls_on_main++;
     }
 }
@@ -136,8 +147,12 @@ static void on_log(void *ctx, RvgLogLevel level, const char *target, size_t targ
 /* Waits up to 10 s for `*n` to reach `want`: a destroy that runs on the display thread. */
 static int wait_for(_Atomic int *n, int want) {
     for (int i = 0; i < 10000 && *n < want; i++) {
+#ifdef _WIN32
+        Sleep(1);
+#else
         struct timespec ms = {0, 1000000};
         nanosleep(&ms, NULL);
+#endif
     }
     return *n == want;
 }
@@ -268,6 +283,7 @@ static void check_device_refusals(void) {
 /* The files behind the map's ranges: a device over guest RAM that is a shared mapping of a file,
  * named in memory_files, and the refusals of the files, each with its table's one destroy. A
  * host built before memory_files passes 48 bytes and is read without them. */
+#ifndef _WIN32
 static void check_memory_files(void) {
     char path[] = "/tmp/rvg-harness-ram.XXXXXX";
     int fd = mkstemp(path);
@@ -329,6 +345,60 @@ static void check_memory_files(void) {
     munmap(shared, RAM_LENGTH);
     close(fd);
 }
+#else
+/* Windows hosts name section handles, while Unix file descriptors are refused. */
+static void check_memory_sections(void) {
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                        0, (DWORD)RAM_LENGTH, NULL);
+    CHECK(section != NULL);
+    if (!section) return;
+    void *shared = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, RAM_LENGTH);
+    CHECK(shared != NULL);
+    if (!shared) { CloseHandle(section); return; }
+    RvgMemoryRange range = {RAM_BASE, RAM_LENGTH, shared};
+    RvgMemoryMap map = {&range, 1};
+    RvgMemoryRangeSection backing = {(uintptr_t)section, 0, RAM_LENGTH, 0, 0};
+    RvgHostCallbacks cb = host_callbacks();
+    RvgDeviceConfig c = device_config(&cb);
+    c.memory_map = &map;
+    c.memory_sections = &backing;
+    host_destroyed = 0;
+    RvgDevice *dev = NULL;
+    CHECK_STATUS(rvg_device_create(&c, &dev), RVG_OK);
+    rvg_device_mmio_write(dev, 0x1034, 0xf5);
+    CHECK(rvg_device_mmio_read(dev, 0x1034) == 0xf5);
+    rvg_device_release(dev);
+    CHECK(host_destroyed == 1);
+
+    dev = (RvgDevice *)0x1;
+    backing.flags = 1;
+    CHECK_STATUS(rvg_device_create(&c, &dev), RVG_ERR_INVALID_ARGUMENT);
+    backing.flags = 0;
+    backing.reserved = 1;
+    CHECK_STATUS(rvg_device_create(&c, &dev), RVG_ERR_INVALID_ARGUMENT);
+    backing.reserved = 0;
+    backing.offset = 1;
+    CHECK_STATUS(rvg_device_create(&c, &dev), RVG_ERR_INVALID_ARGUMENT);
+    backing.offset = 0;
+    backing.length = RAM_LENGTH / 2;
+    CHECK_STATUS(rvg_device_create(&c, &dev), RVG_ERR_INVALID_ARGUMENT);
+    backing.length = RAM_LENGTH;
+    RvgMemoryRangeFile wrong_platform = {-1, 0, 0};
+    c.memory_files = &wrong_platform;
+    CHECK_STATUS(rvg_device_create(&c, &dev), RVG_ERR_INVALID_ARGUMENT);
+    c.memory_files = NULL;
+    CHECK(host_destroyed == 6 && dev == (RvgDevice *)0x1);
+
+    /* Closing the caller's handle does not destroy the library's retained section. */
+    CHECK_STATUS(rvg_device_create(&c, &dev), RVG_OK);
+    CHECK(CloseHandle(section));
+    rvg_device_mmio_write(dev, 0x1034, 0xf5);
+    CHECK(rvg_device_mmio_read(dev, 0x1034) == 0xf5);
+    rvg_device_release(dev);
+    CHECK(host_destroyed == 7);
+    CHECK(UnmapViewOfFile(shared));
+}
+#endif
 
 static RvgDisplayCallbacks display_callbacks(void) {
     RvgDisplayCallbacks cb;
@@ -554,17 +624,26 @@ static void check_trace_handlers(void) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    main_thread = GetCurrentThreadId();
+#else
     main_thread = pthread_self();
+#endif
     if (argc > 1 && strcmp(argv[1], "die-null") == 0) {
         rvg_device_mmio_write(NULL, 0, 0);
         puts("survived");
         return 0;
     }
+#ifdef _WIN32
+    ram = VirtualAlloc(NULL, RAM_LENGTH, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!ram) return 2;
+#else
     ram = mmap(NULL, RAM_LENGTH, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (ram == MAP_FAILED) {
         perror("mmap");
         return 2;
     }
+#endif
     ram_range.physical_address = RAM_BASE;
     ram_range.physical_length = RAM_LENGTH;
     ram_range.host_address = ram;
@@ -573,7 +652,11 @@ int main(int argc, char **argv) {
 
     check_status_and_log();
     check_device_refusals();
+#ifdef _WIN32
+    check_memory_sections();
+#else
     check_memory_files();
+#endif
     check_device();
     check_iosurface();
     check_trace_handlers();

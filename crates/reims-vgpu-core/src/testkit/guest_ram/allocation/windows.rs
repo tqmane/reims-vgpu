@@ -116,6 +116,55 @@ pub unsafe fn dealloc(ptr: *mut u8, _layout: Layout) {
     }
 }
 
+// The core unit binary tests a real 32-GiB Vec boundary too, not only RawRegion.
+// File-backed sparse pages keep that exact addressable span without pagefile commitment.
+#[cfg(test)]
+struct LargeTestAlloc;
+
+#[cfg(test)]
+fn large_test_layout(layout: Layout) -> bool {
+    layout.size() >= 1 << 30 && layout.align() <= 0x1_0000
+}
+
+#[cfg(test)]
+// SAFETY: large allocations have Windows' 64-KiB alignment and are returned to their matching
+// view allocator; every other layout is passed unchanged to System. Only the unit binary uses it.
+unsafe impl std::alloc::GlobalAlloc for LargeTestAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if large_test_layout(layout) {
+            // SAFETY: a new zero-filled view satisfies this layout's size and alignment.
+            unsafe { alloc_zeroed(layout) }
+        } else {
+            // SAFETY: delegated with the caller's valid layout.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if large_test_layout(layout) {
+            // SAFETY: sparse file holes read as zeros throughout the mapped range.
+            unsafe { alloc_zeroed(layout) }
+        } else {
+            // SAFETY: delegated with the caller's valid layout.
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if large_test_layout(layout) {
+            // SAFETY: the allocation came from alloc_zeroed for this same layout.
+            unsafe { dealloc(ptr, layout) }
+        } else {
+            // SAFETY: this layout was delegated to System when allocated.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: LargeTestAlloc = LargeTestAlloc;
+
 #[cfg(test)]
 mod tests {
     use super::*;

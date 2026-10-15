@@ -40,7 +40,8 @@ use std::os::windows::io::OwnedHandle;
 use std::sync::Arc;
 
 pub(crate) use host_os::{
-    Drawables, METAL_LEVEL, TWINS_READ_ONLY, allocate_zeros, import_view, plane_shape, shown_at,
+    Drawables, METAL_LEVEL, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory,
+    import_view, plane_shape, shown_at,
 };
 pub use host_os::{
     GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, default_gpu_core_count,

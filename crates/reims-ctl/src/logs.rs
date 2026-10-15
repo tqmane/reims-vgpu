@@ -192,7 +192,8 @@ pub fn system_info(host: Host) -> String {
                     "sh",
                     &[
                         "-c",
-                        "cat /proc/sys/vm/max_map_count; ls -l /dev/kvm; id; cat /proc/cmdline",
+                        "cat /proc/sys/vm/max_map_count; ls -l /dev/kvm /dev/udmabuf; \
+                         grep -H . /sys/module/udmabuf/parameters/*; id; cat /proc/cmdline",
                     ],
                 ),
             );

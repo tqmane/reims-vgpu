@@ -56,7 +56,8 @@ function Get-ReimsVmConfig {
     foreach ($key in @('base_disk', 'active_disk', 'opencore', 'firmware_code', 'firmware_vars', 'rom')) {
         [void](Assert-ReimsArtifactPath $config.$key)
     }
-    foreach ($key in @('base_disk', 'active_disk', 'opencore', 'firmware_vars')) {
+    # A validation VM may share a read-only base chain inside the project.
+    foreach ($key in @('active_disk', 'opencore', 'firmware_vars')) {
         $vmPrefix = $VmRoot.TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
         if (![IO.Path]::GetFullPath($config.$key).StartsWith($vmPrefix,[StringComparison]::OrdinalIgnoreCase)) {
             throw "VM input must belong to the selected VM folder: $key"

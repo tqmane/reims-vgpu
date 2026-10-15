@@ -285,57 +285,36 @@ impl Default for Logs {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MediaKind {
-    /// A CD drive (`.iso`, `.cdr`), whose disc can be changed while the VM runs.
-    Cdrom,
-    /// A read-only disk (a raw `BaseSystem.img`, as OSX-KVM's and ULTMOS's installers come):
-    /// writes go to a temporary overlay.
-    Disk,
-}
-
-impl MediaKind {
-    pub fn for_path(p: &Path) -> MediaKind {
-        match p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("iso" | "cdr") => MediaKind::Cdrom,
-            _ => MediaKind::Disk,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Q35 {
-    /// The OpenCore image (its own copy in the VM's directory).
+    /// The OpenCore image, in the VM's directory: made for it, or a copy of one given.
     pub opencore: PathBuf,
     #[serde(default)]
     pub opencore_format: ImageFormat,
     /// OVMF's code and variables (copies in the VM's directory).
     pub firmware_code: PathBuf,
     pub firmware_vars: PathBuf,
-    /// The installer: used in place where absolute; relative, the VM's raw copy of a DMG
-    /// (`create::installer_media`), which a change of installer deletes.
+    /// The installer, a raw image (reims-util's offline installer, or a recovery image's raw
+    /// copy) attached as a disk, whose writes go to a temporary overlay: used in place where
+    /// absolute; relative, the VM's raw copy of a DMG (`create::installer_media`), which a change
+    /// of installer deletes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installer: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installer_kind: Option<MediaKind>,
     #[serde(default = "default_cpu_model")]
     pub cpu_model: String,
     #[serde(default = "default_cpu_flags")]
     pub cpu_flags: String,
-    /// The AHCI port of the system disk: 3, as OSX-KVM and ULTMOS attach it. OpenCore's saved
-    /// boot entry names the port.
+    /// The AHCI port of the system disk: 3, after OpenCore's 2, for every VM reims-ctl makes.
+    /// OpenCore's saved boot entry names the port.
     #[serde(default = "default_disk_port")]
     pub disk_port: u32,
 }
 
+/// Skylake-Client without TSX: macOS boots on it without an OpenCore CPUID spoof, and it has no
+/// AVX-512, whose state XNU mishandles on AMD hosts (docs/qemu.md, "x86-64 macOS guests: the CPU
+/// model").
 pub fn default_cpu_model() -> String {
-    "Haswell-noTSX".into()
+    "Skylake-Client-noTSX-IBRS".into()
 }
 
 pub fn default_cpu_flags() -> String {
@@ -374,6 +353,49 @@ impl VmConfig {
         }
     }
 }
+
+impl VmConfig {
+    /// What in these settings the VM's guest does not work with, each a sentence to show the
+    /// user; empty for an arm64 VM. For an x86-64 VM: a display wider than
+    /// [`X86_64_MAX_WIDTH`], or `host`, whose width is the host screen's, and audio off, without
+    /// which Safari's streaming players fail (docs/qemu.md, "x86-64 macOS guests: audio").
+    pub fn incompatibilities(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if self.profile != Profile::Q35X86_64 {
+            return w;
+        }
+        let r = self.display.resolution.trim();
+        let wide = r == "host" || parse_resolution(r).is_ok_and(|(w, _)| w > X86_64_MAX_WIDTH);
+        if wide {
+            let what = if r == "host" {
+                "Resolution host gives this x86-64 VM the host screen's width".to_string()
+            } else {
+                format!("Resolution {r} is too wide for an x86-64 VM")
+            };
+            w.push(format!(
+                "{what}: an x86-64 macOS guest's WindowServer crashes on a display wider than \
+                 {X86_64_MAX_WIDTH} pixels (a bug in macOS), often at boot. Give the VM a \
+                 resolution at most {X86_64_MAX_WIDTH} wide, such as 1920x1080 or 2048x1280."
+            ));
+        }
+        if !self.audio.enabled {
+            w.push(format!(
+                "Audio is off, and without an audio device an x86-64 macOS guest's Safari can't \
+                 play YouTube or other streaming video. Turn it on; to keep the guest silent, \
+                 also run reims-ctl set {} --audio-backend none.",
+                self.name
+            ));
+        }
+        w
+    }
+}
+
+/// The widest mode an x86-64 macOS guest runs. Its WindowServer draws a large window in tiles
+/// 1024 pixels wide, its Metal plugin refuses every bottom-row tile but the first, and with
+/// three tiles across WindowServer reads past its list of tiles and dies. Measured with macOS
+/// 26.6.1: 2560x1600 died at 4 boots of 4 on an RTX 3090 and at about half on an Iris Xe,
+/// 2048x1280 and 1920x1080 at none.
+pub const X86_64_MAX_WIDTH: u32 = 2048;
 
 pub fn check_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
@@ -657,9 +679,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn config_round_trips_through_toml() {
-        let c = VmConfig {
+    fn x86_64_config() -> VmConfig {
+        VmConfig {
             name: "t".into(),
             profile: Profile::Q35X86_64,
             cpus: 4,
@@ -687,15 +708,49 @@ mod tests {
                 firmware_code: "OVMF_CODE.fd".into(),
                 firmware_vars: "OVMF_VARS.fd".into(),
                 installer: Some("/isos/BaseSystem.img".into()),
-                installer_kind: Some(MediaKind::Disk),
                 cpu_model: default_cpu_model(),
                 cpu_flags: default_cpu_flags(),
                 disk_port: 3,
             }),
             vmapple: None,
             extra_env: BTreeMap::from([("A".into(), "b".into())]),
-        };
+        }
+    }
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn incompatibilities_are_an_x86_64_vms_wide_displays_and_silence() {
+        let mut c = x86_64_config();
+        assert!(c.incompatibilities().is_empty());
+        c.display.resolution = "2048x1280".into();
+        assert!(c.incompatibilities().is_empty());
+        c.display.resolution = "2560x1600".into();
+        let w = c.incompatibilities();
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].starts_with("Resolution 2560x1600 is too wide"),
+            "{w:?}"
+        );
+        c.display.resolution = "host".into();
+        c.audio.enabled = false;
+        let w = c.incompatibilities();
+        assert_eq!(w.len(), 2);
+        assert!(w[0].starts_with("Resolution host gives"), "{w:?}");
+        assert!(
+            w[1].contains("reims-ctl set t --audio-backend none"),
+            "{w:?}"
+        );
+        // A resolution check() refuses is its to report.
+        c.display.resolution = "19x".into();
+        assert_eq!(c.incompatibilities().len(), 1);
+        c.display.resolution = "host".into();
+        c.profile = Profile::VmappleArm64;
+        assert!(c.incompatibilities().is_empty());
     }
 }

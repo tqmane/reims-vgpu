@@ -3,7 +3,10 @@
 //! - `$XDG_CONFIG_HOME/reims-ctl` (`~/.config/reims-ctl`): `vms.toml`, the VMs this user has,
 //!   each by its name and directory, and `install.toml`, what scripts/install-ctl.sh installed;
 //! - `$XDG_DATA_HOME/reims-ctl` (`~/.local/share/reims-ctl`): `vms/<name>`, the default home of
-//!   a new VM, and `qemu/<build>`, the QEMU builds, `qemu/current` naming the newest;
+//!   a new VM, `qemu/<build>`, the QEMU builds, `qemu/current` naming the newest, and
+//!   `installers`, the macOS installers reims-util downloaded, which VMs use in place;
+//! - `$XDG_CACHE_HOME/reims-ctl` (`~/.cache/reims-ctl`): builds, scripts/install-ctl.sh's and
+//!   reims-util's (reims_util.rs);
 //! - the runtime directory, for a QMP socket whose path in the VM's directory would be too long
 //!   for a Unix socket: `$XDG_RUNTIME_DIR/reims-ctl`, else `$TMPDIR/reims-ctl-<uid>`.
 //!
@@ -36,6 +39,14 @@ pub fn data_dir() -> PathBuf {
         Some(v) => PathBuf::from(v),
         None => xdg("XDG_DATA_HOME", ".local/share").join("reims-ctl"),
     }
+}
+
+pub fn cache_dir() -> PathBuf {
+    xdg("XDG_CACHE_HOME", ".cache").join("reims-ctl")
+}
+
+pub fn installers_dir() -> PathBuf {
+    data_dir().join("installers")
 }
 
 pub fn default_vms_dir() -> PathBuf {

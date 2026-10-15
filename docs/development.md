@@ -19,7 +19,8 @@ firmware/                   the option ROM: the PCI device's UEFI driver,
 tests/
   suite/                    the behaviour-lock suite (its README)
 scripts/
-  install-ctl.sh            builds and installs reims-ctl and its QEMU
+  install-ctl.sh            builds and installs reims-ctl and its QEMU (and
+                            reims-util, on Linux)
   run_vmapple.sh            boots a macOS VM on make qemu's QEMU
   vm_drive.py, vm_ocr.swift drive a VM through a fixed tour
   walk_window_macos.sh      the manual walk of a display's window on macOS

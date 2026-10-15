@@ -1149,7 +1149,9 @@ device and BAR 2 on the old pages: the pages stay the framebuffer's only where t
 runtime data in place. OpenCore's `AvoidRuntimeDefrag` does so: while boot.efi lays out the
 runtime memory, it marks runtime code and data that carry the runtime attribute, which edk2 gives
 this buffer, as MMIO (read from OpenCore's `OcAfterBootCompatLib` and edk2's `Page.c`).
-mac-temp's and macos-26's OpenCore configurations set it (read from their `config.plist`). Before
+reims-util's image, which reims-ctl makes for each new x86-64 VM, keeps it on from OpenCore
+1.0.8's `Sample.plist`, and mac-temp's and macos-26's configurations set it (read from code and
+from their `config.plist`). Before
 BAR 2 the kernel drew to the same pages directly.
 
 **Pages.** The driver writes 0x1210 in 4 KiB pages and rounds the length up to 4 KiB, the

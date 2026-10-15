@@ -251,6 +251,9 @@ pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
     crate::tasks::isolation::life::trap(id, detail);
     #[cfg(any(test, feature = "testkit"))]
     if crate::testkit::capture::capture_enabled() {
+        if crate::testkit::capture::current_slot().is_none() {
+            eprintln!("{}", message(&id, detail));
+        }
         crate::testkit::capture::capture(id.site())
     }
     let mut line = message(&id, detail);

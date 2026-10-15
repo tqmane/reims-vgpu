@@ -8,6 +8,7 @@
 mod budget;
 mod clock;
 use super::backing as files;
+mod dma_buf;
 mod import;
 use super::standin as surface;
 mod threads;
@@ -29,7 +30,9 @@ pub(super) fn warn_if_short(guest_ram: u64) {
     budget::warn_if_short(guest_ram);
 }
 
-pub(crate) use import::{TWINS_READ_ONLY, allocate_zeros, import_view, shown_at};
+pub(crate) use import::{
+    TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view, shown_at,
+};
 pub(crate) use surface::{plane_at, plane_shape, recorded_mut, ycbcr_matrix};
 #[cfg(test)]
 pub(crate) use vm::allocate_aliasable;

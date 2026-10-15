@@ -20,7 +20,11 @@
 #      with;
 #   4. installs reims-ctl with cargo install (into ~/.cargo/bin, or
 #      CARGO_INSTALL_ROOT's bin), signed on macOS with the virtualization
-#      entitlement, which installing macOS from an IPSW needs.
+#      entitlement, which installing macOS from an IPSW needs;
+#   5. on Linux, installs reims-util beside it, which makes a new x86-64 VM's
+#      OpenCore image and downloads its macOS installer from Apple: reims-ctl
+#      does (__record-install), at the commit it names
+#      (crates/reims-ctl/src/reims_util.rs).
 #
 # --yes       install what is missing without asking (rustup with -y too)
 # --update    pull this checkout first (git pull --ff-only); reims-ctl update
@@ -129,19 +133,18 @@ else
   # The library (cargo xtask dist: clang, lld and binutils for the option ROM;
   # CMake and the X11, Wayland, xkbcommon and EGL headers for SDL3's video,
   # which it builds from source), and QEMU (glib, pixman, libslirp; pipewire,
-  # pulse and ALSA for its audio backends; bzip2 unpacks its firmware), and
-  # OVMF, the firmware a new x86-64 VM boots when no OpenCore folder brings its
-  # own (QEMU's x86-64 build installs no variable store).
+  # pulse and ALSA for its audio backends; bzip2 unpacks its firmware). A new
+  # x86-64 VM's OVMF comes from reims-util, with its OpenCore image.
   apt_pkgs=(build-essential git curl ca-certificates pkg-config python3 python3-venv ninja-build
     flex bison bzip2 cmake clang lld binutils libglib2.0-dev libpixman-1-dev libslirp-dev
     zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libvulkan1
     libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev
     libxtst-dev libxkbcommon-dev libwayland-dev libwayland-bin libdecor-0-dev
-    libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev ovmf)
+    libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev)
   pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake clang lld
     glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib vulkan-icd-loader
     libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
-    wayland libdecor mesa libdrm dbus systemd-libs edk2-ovmf)
+    wayland libdecor mesa libdrm dbus systemd-libs)
   case " $distro_id $distro_like " in
     *" debian "* | *" ubuntu "*)
       for p in "${apt_pkgs[@]}"; do
@@ -171,9 +174,18 @@ else
   if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or VMs will not start"
   fi
+  # A new VM gets half the host's memory, 4 to 16 GiB, and its views of guest
+  # memory take about 64 mappings per MiB (reims-ctl's runtime::max_map_count).
   maps="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
-  if ((maps < 1048576)); then
-    warn "vm.max_map_count is $maps: a 12 GiB guest needs about 1048576 (sudo sysctl -w vm.max_map_count=1048576, and a file in /etc/sysctl.d to keep it)"
+  vm_mib=$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 2 / 1048576 * 1024))
+  vm_mib=$((vm_mib < 4096 ? 4096 : vm_mib > 16384 ? 16384 : vm_mib))
+  if ((maps < vm_mib * 64 + 81920)); then
+    warn "vm.max_map_count is $maps: a new VM's $((vm_mib / 1024)) GiB needs about $((vm_mib * 64 + 81920)) (sudo sysctl -w vm.max_map_count=2097152, and a file in /etc/sysctl.d to keep it)"
+  fi
+  # An AMD GPU (RADV) imports the guest's memory as dma-bufs made by udmabuf
+  # (docs/qemu.md, "Linux hosts: AMD GPUs and udmabuf").
+  if grep -qsx 0x1002 /sys/class/drm/*/device/vendor && [[ ! -r /dev/udmabuf || ! -w /dev/udmabuf ]]; then
+    warn "/dev/udmabuf is not usable by you: a VM on an AMD GPU needs it for the guest's memory (add yourself to the group that owns it, kvm on Ubuntu: sudo usermod -aG kvm \$USER; log in again)"
   fi
 fi
 

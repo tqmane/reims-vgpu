@@ -826,9 +826,9 @@ mod tests {
     /// A surface over pages no file is behind is refused, nothing left mapped
     #[test]
     fn pages_without_a_file_are_refused() {
-        let vm = LinuxVm::new();
         let page = page_size();
-        let at = vm.allocate_anywhere(2 * page).unwrap().addr().to_u64();
+        let ram = reims_vgpu_core::testkit::guest_ram::RawRegion::new(2 * page).unwrap();
+        let at = ram.addr().addr().to_u64();
         let ranges: Vec<_> = (0..2)
             .map(|i| PhysicalMemoryRange {
                 physical_address: at + i * page,
@@ -841,7 +841,7 @@ mod tests {
             ..host_only()
         };
         assert!(StandInSurfaces::new().create(&spec).is_none());
-        free(at, 2 * page);
+        drop(ram);
     }
 
     /// A surface made from plane properties is its planes' whole pages, 1 byte per element and

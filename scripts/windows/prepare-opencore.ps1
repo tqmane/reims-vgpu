@@ -193,12 +193,13 @@ if (!$Rebuild -and (Test-Path -LiteralPath $image) -and (Test-Path -LiteralPath 
 }
 if ($Rebuild -or !(Test-Path -LiteralPath $image)) {
     Invoke-ReimsTool $QemuImg @('convert', '-f', 'vvfat', '-O', 'raw', ('fat:' + $efiRoot.Replace('\', '/')), "$image.partial")
-    $stream = [IO.File]::Open("$image.partial", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
+    $stream = [IO.File]::OpenRead("$image.partial")
     try {
         [void]$stream.Seek(510, [IO.SeekOrigin]::Begin)
         if ($stream.ReadByte() -ne 0x55 -or $stream.ReadByte() -ne 0xaa) { throw 'vvfat did not produce an MBR.' }
         [void]$stream.Seek(450, [IO.SeekOrigin]::Begin)
-        $stream.WriteByte(0xef) # Mark vvfat's FAT partition as an EFI System Partition.
+        # Keep the FAT16 partition type; macOS cannot probe this filesystem tagged as 0xEF.
+        if ($stream.ReadByte() -notin @(0x06, 0x0e)) { throw 'Expected vvfat FAT16 partition type.' }
     } finally { $stream.Dispose() }
     Move-Item -LiteralPath "$image.partial" -Destination $image -Force
 }

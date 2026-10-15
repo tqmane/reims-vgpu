@@ -50,7 +50,7 @@ The Makefile's header lists every target (`bless`, `coverage`, `qemu`, `vm`,
 | what | where |
 |---|---|
 | the Cargo workspace and its six crates | `Cargo.toml`, `crates/` |
-| `reims-ctl`, the VM manager users run, and its installer | `crates/reims-ctl` (a workspace of its own, linking nothing of the library), `scripts/install-ctl.sh` |
+| `reims-ctl`, the VM manager users run, and its installer | `crates/reims-ctl` (a workspace of its own, linking nothing of the library), `scripts/install-ctl.sh`; reims-util, which it runs to make an x86-64 VM's OpenCore image and download its installer, is pinned in `crates/reims-ctl/src/reims_util.rs` |
 | the C API | `crates/reims-vgpu-c/include/reims_vgpu.h`, specified in [docs/api.md](docs/api.md) |
 | isolated tasks | `crates/reims-vgpu-core/src/tasks/isolation`, `crates/reims-vgpu-core/src/gpu_task` |
 | the display's and XR10's shaders | `crates/reims-vgpu-metal/src/gpu/shaders.metal` |

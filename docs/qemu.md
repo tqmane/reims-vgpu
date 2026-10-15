@@ -440,6 +440,48 @@ views. When a guest's RAM is leased, the library warns if the RAM, in 16 KiB
 pieces, would not fit. `sysctl -w vm.max_map_count=1048576` covers a 12 GiB
 guest.
 
+### Linux hosts: AMD GPUs and udmabuf
+
+RADV refuses to import pages with a file behind them as host memory, and the
+guest's RAM and the library's views are all memfd pages, so a macOS 26 guest
+on an AMD GPU died at its first no-copy buffer: `reims-vgpu: fatal: platform
+call newBufferWithBytesNoCopy:length:options:deallocator:: the Vulkan runtime
+refused it: unsupported: Unsupported { feature: HostMemory, ... }` (Radeon
+780M, RADV of Mesa 26.0.8, Linux 7.0, 2026-10-11). Where the pointer import is
+refused, the runtime now imports dma-bufs of the same pages, which the library
+makes with `/dev/udmabuf`, cut into chunks within udmabuf's limits as the host
+has them (`crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs`). The device node
+is the `kvm` group's on Ubuntu.
+
+What the chunks must hold, measured on an RTX 3090 host (where every import is
+host memory) with that guest, 14 GiB, one 1920x1080 display, on 2026-10-11:
+at the idle desktop, 829 imports, the largest 63.3 MiB, 19 of more than 1024
+runs of file pages and the most 16,201 (4 KiB pieces); with Safari open on
+wikipedia.org, 4,551 imports and 29 of more than 1024 runs. At udmabuf's
+defaults (1024 runs, 64 MiB) the 16,201-run import is 16 chunks.
+
+On the Radeon 780M with udmabuf at its defaults and metal2vulkan `11715e2a3f`
+(2026-10-12), the guest cold-booted to its desktop, and Safari loaded
+wikipedia.org and quit with no death: 5,119 dma-buf requests, textures' own
+among them, none refused; 5,095 took one dma-buf, 19 two, 2 three, 2 seven and
+1 sixteen.
+
+### Linux hosts: Intel GPUs without a shared last-level cache
+
+Arrow Lake-S's iGPU (`deviceID` 0x7d67, Xe-LPG; ANV of Mesa 26.2.4 on i915,
+Linux 7.2) shares no last-level cache with the host, and ANV's one host-cached
+memory type there is not coherent (`DEVICE_LOCAL | HOST_VISIBLE |
+HOST_CACHED`). metal2vulkan placed `Shared` and `Managed` textures in it for
+their host copies, and the GPU read stale 64-byte lines of them: an x86-64
+macOS 26 guest showed sparse, fully transparent 4x4-pixel blocks (one line of a
+Tile4 32-bit image) in its boot logo, Dock icons and widgets, kept in each
+texture (2026-10-12). Measured as the dark share of the boot logo's interior
+once the GPU draws it, at 57 and 60 s of a cold boot: 34% at metal2vulkan
+`11715e2a3f`; 6 and 17% with `INTEL_DEBUG=noccs`, with stale bright blocks
+outside the logo too; 14 and 29% with `INTEL_DEBUG=stall`. Since `edb5ffd8cc`,
+which keeps a host-copied texture out of memory the host maps without
+coherence, there are none, and the Dock and widgets are whole.
+
 ### Linux hosts: NVIDIA's pipeline import budget
 
 Measured on an RTX 3090 and an RTX 5080 Laptop GPU, NVIDIA driver
@@ -457,14 +499,26 @@ records were each suspected first and ruled out.
 
 ### x86-64 macOS guests: Metal's error mode
 
-An x86-64 macOS guest needs one setting, made once inside the guest:
+An x86-64 macOS guest needs one setting, made once inside the guest. On a
+desktop that comes up:
 
 ```sh
 sudo defaults write /Library/Preferences/.GlobalPreferences METAL_ERROR_MODE -int 5
 ```
 
-Without it the guest's icon service ends as it starts, again and again, and
-apps wait minutes for their icons. Mode 5, the same as
+A new install's desktop does not come up without it, so there it is made
+from macOS Recovery (OpenCore's Recovery entry, then Utilities > Terminal),
+on the Data volume, followed by `reboot`:
+
+```sh
+cd /Volumes/*Data/Library/Preferences
+defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5
+chmod 644 .GlobalPreferences.plist
+```
+
+Without it the guest's icon service ends as it starts, again and again:
+apps wait minutes for their icons, and a guest with no icon cache yet, as a
+new install has, shows only its wallpaper. Mode 5, the same as
 `MTL_ERROR_MODE=nslog`, has Metal log an error report and go on rather than
 end the process. Every process of every user reads the key, root's
 included, from its next launch on, so a boot needs nothing else.
@@ -492,6 +546,42 @@ Measured on an RTX 5080 Laptop GPU host with a macOS 26.6.1 guest on 2026-10-11:
   is the only Metal error report any process logs.
 - Nothing of the archive reaches the host: QEMU's log has no line of it,
   with or without the key.
+
+A new install, and the key made from Recovery. Measured on an RTX 3090 host
+(Ubuntu 26.04, NVIDIA 615.71.09) on 2026-10-12, with a macOS 26.6.1 guest on
+a qcow2 overlay of its disk, and the library and QEMU at `9b2c5452`:
+- With the key, the desktop was up 60 s after the picker, with no exec
+  fault.
+- With the key deleted and the icon caches kept, the desktop was up by
+  80 s. iconservicesagent, `com.apple.dock.extra` and Spotlight each ended
+  every 10-20 s, and the host logged an exec fault for most of the ends.
+- With the key deleted and the icon caches deleted too, as a new install
+  has none (`/Library/Caches/com.apple.iconservices.store`, and the user's
+  `com.apple.dock.iconcache`, `com.apple.dock.extra`,
+  `com.apple.iconservices` and `com.apple.iconservicesagent` under `getconf
+  DARWIN_USER_CACHE_DIR`), and the host's shader cache empty: only the
+  wallpaper, with no menu bar, Dock or widgets, still at 5 min. The Dock's
+  main thread waited in `-[ISConcreteIcon generateImageWithDescriptor:]`,
+  in `xpc_connection_send_message_with_reply_sync` to iconservicesagent,
+  which had ended 15 times. A beta tester's new install on an RTX 3050
+  Laptop GPU host (NVIDIA 615.71.09) showed the same: the wallpaper only,
+  and the same exec faults in QEMU's log.
+- Recovery boots on BAR 2 ("x86-64 macOS guests: installers and recovery",
+  below) to its window by 60 s after the picker, with the Data volume at
+  `/Volumes/<name> - Data` and no password asked. The commands above
+  brought that guest's desktop back by 80 s after the picker, with no exec
+  fault.
+- Two traps on the way there. `defaults write
+  /Volumes/*\ -\ Data/Library/Preferences/.GlobalPreferences ...` expands
+  no glob, since no file has that name without `.plist`: it made a literal
+  `/Volumes/* - Data` in Recovery's RAM disk and wrote the key there. The
+  `cd` expands the glob through the directory. And `defaults` leaves the
+  file at mode 0600, where the user's processes read no key (`defaults
+  read` as the user finds no such pair, as root it finds 5), so the icon
+  service went on ending until `chmod 644`.
+- Finder's Dock icon, asked for while the icon service was failing, stayed
+  blank after the fix, also after `killall Dock`. Deleting the user's
+  `com.apple.dock.iconcache` and then `killall Dock` brought it back.
 
 No value the host supplies decides any of this, so Apple's own host would
 end an x86-64 macOS 26 guest's icon service the same way. Read from the
@@ -538,6 +628,13 @@ Laptop GPU host on 2026-10-11 (macOS 26.6.1, one library build):
   exec after the guest's teardown. A host that decoded faster would only
   narrow the window: some faulting execs started after their process had
   ended.
+- Such an exec can also end QEMU. A render pipeline it makes resolves its
+  functions from entries already emptied, gets nil for them ("pipeline
+  function N not found, given to Metal as nil"), and dies where Metal
+  aborts at a render descriptor with no vertex function, as Apple's
+  framework was measured to (docs/testing.md, `render_objects_malformed_*`
+  and `interplay_lifetime_held_pipeline_function_retyped`). Seen once, in
+  the RTX 3050 beta tester's log of a boot before the key was set.
 
 ### x86-64 macOS guests: thumbnail extensions
 
@@ -698,6 +795,107 @@ time below includes that wait, with QEMU started at nice 0:
 
 Not measured: an installation run to its end, and installers and guests
 before macOS 26.
+
+### x86-64 macOS guests: the CPU model
+
+`reims-ctl` gives a new VM `Skylake-Client-noTSX-IBRS`. Under KVM the model
+sets only what CPUID reports; with `check`, QEMU drops a feature the host
+lacks and warns once per vCPU. A VM keeps the model it was made with in its
+`vm.toml` (`cpu_model` and `cpu_flags` under `[q35]`; VMs `reims-ctl` made
+before 2026-10-12 have `Haswell-noTSX`): edit them there, or remove both for
+the default, and the VM runs the new model from its next start.
+
+- **Haswell-noTSX** is model 60, stepping 1. XNU panics on model 60 below
+  stepping 3 ("Haswell pre-C0 steppings are not supported",
+  `osfmk/i386/machine_check.c`, read from code). It boots only behind an
+  OpenCore that replaces CPUID leaf 1 (`Kernel > Emulate > Cpuid1Data`):
+  reims-util's image sets `0x00050654`, Skylake-SP stepping 4, unless made
+  with `--no-cpuid-spoof` (read from code), so its guests see model 85 under
+  any `-cpu`.
+- **Cascadelake-Server** (v1) adds TSX, which no host here has, and AVX-512,
+  which Intel's hybrid parts (12th generation on) lack. On an AMD host with
+  AVX-512 the guest gets it, and XNU saves its registers at Intel's XSAVE
+  offsets only (`fp_avx512_offset`, `osfmk/i386/fpu.c`, read from code).
+- **Skylake-Client-noTSX-IBRS** is model 94, which XNU knows, so it boots
+  with or without the leaf 1 spoof; it is Haswell plus RDSEED, ADX, SMAP,
+  XSAVEC, PREFETCHW and IBRS, with no AVX-512.
+
+Measured on 2026-10-12 on homelab-um780 (a Ryzen 7 7840HS, Zen 4, QEMU at
+`871e0931`) with an x86-64 macOS 26.6.1 guest (25G76) on `snapshot=on`
+overlays, behind an OpenCore whose `Cpuid1Data` is `0x00050654`, on the
+RTX 3090:
+- `query-cpu-definitions` under KVM: every model above lacks only `pcid`
+  here (plus `hle` and `rtm` for Cascadelake-Server v1); on homelab-ms01 (a
+  Core i9-13900H) Haswell-noTSX and Skylake-Client-noTSX-IBRS lack nothing,
+  and Cascadelake-Server lacks TSX and all of its AVX-512.
+- Haswell-noTSX and Cascadelake-Server each reached the desktop, SSH up at
+  66 s; both report model 85 stepping 4 and `hw.cpufamily` `0x37fc219f`
+  (Skylake), and only Cascadelake-Server sets `hw.optional.avx512f`.
+- Cascadelake-Server's guest reads AMD's layout from CPUID 0xD: opmask at
+  832, ZMM_Hi256 at 896, Hi16_ZMM at 1408 (Intel's are 1088, 1152 and 1664).
+  In each of three runs, `k3` read 0 after a signal handler returned, and
+  `thread_get_state(x86_AVX512_STATE64)` gave wrong zmm16, upper zmm1 and
+  `k3`; setting that state back zeroed `k3` in the thread.
+- Single-thread, Cascadelake-Server over Haswell-noTSX: Accelerate's sgemm
+  and dgemm (1024) 37% and 34% faster, SHA-256 and SHA-512 about 20%, LZFSE
+  encode 30% and decode 12%; FFT, vImage, memcpy and memset the same.
+
+Not measured: a boot on Skylake-Client-noTSX-IBRS itself, and a boot behind
+an OpenCore that leaves leaf 1 as it is.
+
+### x86-64 macOS guests: displays at most 2048 pixels wide
+
+An x86-64 macOS guest's WindowServer dies at boot, often enough to matter,
+on a display wider than 2048 pixels. The guest then comes up at the login
+window instead of logging in on its own, and later shows "WindowServer quit
+unexpectedly". METAL_ERROR_MODE (above) does not change it.
+
+The cause is in the guest, between its WindowServer and its Metal plugin for
+the PCI device, read from the code of macOS 26.6.1's (25G76) x86-64
+SkyLight and plugin:
+- SkyLight draws a window of at least 1024 × 1024 pixels' area in tiles of
+  1024 × 1024 pixels, from the left and the top. Each tile is a texture
+  made with `newTiledTextureWithDescriptor:offset:bytesPerRow:` over a
+  no-copy buffer of the window's pixels, the buffer ending within a page of
+  the window's last row. Its client storage debug option, off by default,
+  would make private textures instead; arm64 SkyLight makes private
+  textures.
+- The plugin counts a tile's bytes as its offset plus its rows times the
+  window's bytes per row, and refuses a tile that ends past the buffer. So
+  every tile of the bottom row but the first is refused: the count runs
+  past the buffer's end by the tile's offset in the row.
+- SkyLight keeps the textures it got in a list, skipping the refused ones,
+  and draws tile *n* with the list's *n*th entry, unchecked. With two tiles
+  across (2048 pixels or narrower) the one missing entry falls inside the
+  list's allocation; with three or more, the reads land past it, and
+  WindowServer dies on a texture pointer into freed memory, in the plugin's
+  `IOAccelResourceListAddResource`. Where its first command buffer is still
+  queued, the guest kernel frees WindowServer's objects under it, and the
+  host logs `task 1: exec faulted: resource 14 not found`, then sees a GPU
+  restart; a death before it leaves no line on the host.
+
+No answer of the host's reaches the plugin's count, so a guest on Apple's
+framework would meet it too (not measured).
+
+Measured on 2026-10-11 and 12 with a macOS 26.6.1 guest, from fresh
+overlays:
+- WindowServer's log holds the plugin's refusal at each boot: at 2560 ×
+  1600, allocations of 16388096 and 16392192 bytes against a buffer of
+  16384000 (the bottom row's second and third tiles); at 1920 × 1080, one
+  of 8298496 against 8294400.
+- On homelab-um780's RTX 3090, windowed, counted by the host's line (so a
+  death before the first command buffer is missed): 2560 × 1600 died at 4
+  boots of 4, 2304 × 1440 at 2 of 2, 2176 × 1360 at none of 2, 2048 × 1280
+  at none of 2; headless (`display-modes`), 2560 × 1600 at 1 of 3. On
+  homelab-ms01's Iris Xe, windowed, counted by the guest's crash reports,
+  2560 × 1600 died at about half its boots (13 of 29). 1920 × 1080 died at
+  none of 14 across both hosts, windowed and headless.
+- A tester's 2736 × 1704 (`resolution = "host"`, an Iris Xe under Linux)
+  left the host's line in 2 of its 5 boots' logs.
+
+Not measured: what the guest shows of a refused tile at 2048 pixels or
+narrower (the bottom-right tile of a large window), and an x86-64 guest
+older than macOS 26.
 
 ### App Nap
 
@@ -1531,3 +1729,14 @@ now omits ACPI S3/S4 and guest setup disables automatic system sleep and
 hibernation. This does not change the library's suspend/resume API. Guest
 shutdown and power-on in the same process remain supported. USB selections
 added through QMP are checked against live device IDs when reusing it.
+
+The preserved Windows engine's 2026-10-14 validation boot at 1920x1080
+logged XNU RTCLOCK 3190000000 Hz (3187198000 calibrated), close to the
+native host's measured 3.187 GHz. The earlier 6.4 GHz discrepancy did not
+recur in this run. This alone does not establish GPU timeout correctness.
+The baseline reached the desktop and Safari. Its ACPI shutdown exceeded
+50 seconds while restored Simulator services were active, then reached
+QMP `shutdown` and exited QEMU cleanly. Keep a shutdown deadline failure
+separate from a guest GPU hang, and check the guest and QMP state before
+terminating the engine. The comparison uses sibling writable overlays
+over an offline frozen checkpoint, with firmware and NVRAM copies.

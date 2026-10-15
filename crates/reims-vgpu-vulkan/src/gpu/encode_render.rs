@@ -5118,9 +5118,9 @@ pub(crate) mod tests {
     /// A pass whose colour resolve the device averages and rounds, which the runtime announces
     /// (`DeviceRoundedResolve`), dies at `endEncoding` where the format was not measured to
     /// resolve as Metal's, `RG11B10Float` (92) at 4 samples, naming it; one of a measured format,
-    /// `RGBA16Float` at 4 samples, ends ([`device_rounded`]). On this host neither pass announces
-    /// it, as MoltenVK's resolve is Metal's own, and both end: the death is
-    /// asked of the passes' descriptors as a device that announces it would end them
+    /// `RGBA16Float` at 4 samples, ends ([`device_rounded`]). MoltenVK announces neither and
+    /// both end; a native device that announces the rounding dies at the unmeasured pass's
+    /// end. The descriptors check that same decision independently on either host.
     #[test]
     fn an_unmeasured_device_resolve_dies_at_the_end() {
         use reims_vgpu_core::raise::death::DeathKind;
@@ -5160,15 +5160,21 @@ pub(crate) mod tests {
             let q = d.new_command_queue().unwrap();
             let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
             let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-            e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+            let result = catch_death(|| e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap());
             let mut ended = rt::RenderPassDescriptor::default();
             ended.color_attachments[0].texture = Some(samples.raw.clone());
-            ended
+            (ended, result)
         };
-        let measured = end(RGBA16F);
-        let unmeasured = end(92);
+        let (measured, measured_end) = end(RGBA16F);
+        assert!(measured_end.is_ok());
+        let (unmeasured, unmeasured_end) = end(92);
         let relayed = crate::answer::RELAYED.lock().clone();
-        assert!(!relayed.contains(&rt::Degradation::DeviceRoundedResolve));
+        if relayed.contains(&rt::Degradation::DeviceRoundedResolve) {
+            let site = unmeasured_end.unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, "endEncoding"));
+        } else {
+            assert!(unmeasured_end.is_ok());
+        }
         device_rounded("endEncoding", &measured);
         *crate::answer::LAST_LINE.lock() = None;
         let site = catch_death(|| device_rounded("endEncoding", &unmeasured)).unwrap_err();

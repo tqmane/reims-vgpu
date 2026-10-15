@@ -12,9 +12,11 @@ mod logs;
 mod paths;
 mod qemu;
 mod qmp;
+mod reims_util;
 mod runtime;
 mod tui;
 mod update;
+mod view;
 mod vm;
 mod vz;
 

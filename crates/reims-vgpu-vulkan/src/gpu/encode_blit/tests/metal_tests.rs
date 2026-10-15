@@ -2602,12 +2602,10 @@ fn pattern_fills_are_the_metal_platforms() {
 /// 10-bit code the bits replicate to differ. A `chain` line names a format and a first level's
 /// extent; each line below it is a texel of the first computed level: its position, the alpha
 /// codes of its four taps (base 4: the first tap's, the next across, the next down, the next
-/// across and down) and the code Metal stored.
-const TWO_BIT_TIES: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../metal2vulkan-integration/crates/metal2vulkan",
-    "/src/bind/mipmap_filter/measured_2bit.txt"
-));
+/// across and down) and the code Metal stored. A copy of metal2vulkan's
+/// `crates/metal2vulkan/src/bind/mipmap_filter/measured_2bit.txt`, so the test reads it wherever
+/// the checkout lies.
+const TWO_BIT_TIES: &str = include_str!("measured_2bit.txt");
 
 /// `MTLPixelFormatRGB10A2Unorm` and `MTLPixelFormatBGR10A2Unorm`, whose alpha is a texel's top
 /// two bits.
