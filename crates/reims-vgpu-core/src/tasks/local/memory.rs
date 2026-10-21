@@ -10,6 +10,7 @@ use super::{
 use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
 use crate::host::{HostPtr, PhysRange};
 use crate::memory::cursor::Cursor;
+use crate::memory::map::GuestPages;
 use crate::memory::mapping::Mapping;
 use crate::memory::tracker::RangeTracker;
 use crate::num::{ToU64, ToUsize};
@@ -200,6 +201,36 @@ impl<P: Platform> LocalTask<P> {
         length: u64,
         need_writable: bool,
     ) -> RaiseResult<Option<Arc<Mapping<P>>>> {
+        let (ranges, writable) = self.page_runs(hold, offset, length)?;
+        if need_writable && !writable {
+            return Ok(None);
+        }
+        let memory_map = self.device.upgrade().and_then(|d| d.memory_map());
+        Ok(memory_map.and_then(|m| m.new_range_mapping(&ranges, length, u32::from(!writable))))
+    }
+
+    /// The task's pages `offset..offset + length` read and written through the device's memory
+    /// map, with no mapping made ([`GuestPages`]); `None` without a memory map. Its page walk and
+    /// checks are [`Self::virtual_mapping`]'s.
+    pub(super) fn guest_pages(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+    ) -> RaiseResult<Option<GuestPages<P>>> {
+        let (ranges, writable) = self.page_runs(hold, offset, length)?;
+        let memory_map = self.device.upgrade().and_then(|d| d.memory_map());
+        Ok(memory_map.map(|m| GuestPages::new(m, ranges, writable)))
+    }
+
+    /// The physical runs of the task's pages `offset..offset + length`, and whether every page
+    /// is writable.
+    fn page_runs(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+    ) -> RaiseResult<(Vec<PhysRange>, bool)> {
         check_mappable(offset, length, self.length, !self.task_root.is_null())?;
         let mut ranges: Vec<PhysRange> = Vec::new();
         let mut writable = true;
@@ -236,11 +267,7 @@ impl<P: Platform> LocalTask<P> {
         if range.physical_length != 0 {
             ranges.push(range);
         }
-        if need_writable && !writable {
-            return Ok(None);
-        }
-        let memory_map = self.device.upgrade().and_then(|d| d.memory_map());
-        Ok(memory_map.and_then(|m| m.new_range_mapping(&ranges, length, u32::from(!writable))))
+        Ok((ranges, writable))
     }
 
     /// The host address of task memory at `offset`, mapped for `length` bytes. In the map setup
