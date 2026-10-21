@@ -7,13 +7,16 @@ param(
     [switch]$GenerateIdentity,
     [string]$IdentityFile,
     [ValidateSet('Keep','Enable','Disable')][string]$AppleAccountCompatibility = 'Keep',
+    [ValidateRange(0,60)][Nullable[int]]$PickerTimeout,
     [switch]$Rebuild
 )
+$pickerRequested = $PSBoundParameters.ContainsKey('PickerTimeout')
 . "$PSScriptRoot/start.ps1" -FunctionsOnly
 Assert-ReimsVmStopped
 if ($GenerateIdentity -and !$Rebuild) { throw 'Use -GenerateIdentity with -Rebuild.' }
 if ($IdentityFile -and (!$Rebuild -or $GenerateIdentity)) { throw 'Use -IdentityFile with -Rebuild, without -GenerateIdentity.' }
 if ($AppleAccountCompatibility -ne 'Keep' -and !$Rebuild) { throw 'Use -AppleAccountCompatibility with -Rebuild.' }
+if ($pickerRequested -and !$Rebuild) { throw 'Use -PickerTimeout with -Rebuild.' }
 $downloads = Join-Path $ProjectRoot '.work/downloads'
 $releasePath = Join-Path $downloads "OpenCore-$Version-release.json"
 if (!(Test-Path -LiteralPath $releasePath)) {
@@ -57,11 +60,11 @@ c['DeviceProperties']['Delete'] = {}
 c['Booter']['Quirks'].update(EnableWriteUnprotector=False, RebuildAppleMemoryMap=True, SyncRuntimePermissions=True)
 c['Kernel']['Emulate']['DummyPowerManagement'] = True
 c['Kernel']['Quirks'].update(AppleXcpmExtraMsrs=True, DisableLinkeditJettison=False, ForceSecureBootScheme=False)
-c['Misc']['Boot'].update(HideAuxiliary=False, Timeout=0)
+c['Misc']['Boot'].update(ShowPicker=True, HideAuxiliary=False, Timeout=5)
 c['Misc']['Debug'].update(AppleDebug=True, ApplePanic=True, DisplayLevel=0x80000042, Target=75)
 c['Misc']['Serial']['Init'] = True
 # Scan Apple filesystems, excluding the FAT bootstrap volume that would boot OpenCore again.
-c['Misc']['Security'].update(ScanPolicy=0x301, SecureBootModel='x86legacy', DmgLoading='Signed', Vault='Optional')
+c['Misc']['Security'].update(AllowSetDefault=True, ScanPolicy=0x301, SecureBootModel='x86legacy', DmgLoading='Signed', Vault='Optional')
 apple = '7C436110-AB2A-4BBB-A880-FE41995C9F82'
 c['NVRAM']['Add'][apple] = {'boot-args': '-v keepsyms=1 serial=3 debug=0x108', 'csr-active-config': bytes(4),
                           'prev-lang:kbd': b'en:252', 'run-efi-updater': 'No'}
@@ -116,6 +119,26 @@ manifest.write_text(json.dumps(i, indent=2) + '\n', encoding='utf-8')
     "Generated a VM-specific identity; preserved SystemUUID. Backup: $backup"
 }
 $validate = Join-Path $package 'Utilities/ocvalidate/ocvalidate.exe'
+if ($pickerRequested) {
+    $backup = Join-Path $ProjectRoot ('.work/diagnostics/opencore-before-picker-' + [guid]::NewGuid().ToString('N') + '.plist')
+    Copy-Item -LiteralPath $plist -Destination $backup
+    $candidate = "$backup.candidate"
+    $pickerEdit = @'
+import plistlib, pathlib, sys
+source, destination, timeout = sys.argv[1:]
+c = plistlib.loads(pathlib.Path(source).read_bytes())
+timeout = int(timeout)
+assert 0 <= timeout <= 60, 'Picker timeout must be between 0 and 60 seconds'
+c['Misc']['Boot'].update(ShowPicker=True, Timeout=timeout)
+c['Misc']['Security']['AllowSetDefault'] = True
+pathlib.Path(destination).write_bytes(plistlib.dumps(c, sort_keys=False))
+'@
+    $pickerEdit | & $python - $plist $candidate $PickerTimeout
+    if ($LASTEXITCODE -ne 0) { throw 'Boot picker update failed; original config is unchanged.' }
+    Invoke-ReimsTool $validate @($candidate) | Out-Null
+    Move-Item -LiteralPath $candidate -Destination $plist -Force
+    "Boot picker timeout: $PickerTimeout seconds. Backup: $backup"
+}
 if ($IdentityFile) {
     [void](Assert-ReimsArtifactPath $IdentityFile)
     $backup = Join-Path $ProjectRoot ('.work/diagnostics/opencore-before-edit-' + (Get-Date -Format 'yyyyMMdd-HHmmss-ffff') + '.plist')
