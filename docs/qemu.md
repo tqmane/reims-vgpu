@@ -1758,3 +1758,9 @@ disk and firmware booted macOS after restricting the installed macOS
 profile to APFS/HFS discovery (`ScanPolicy=0x301`). This boot and the disk
 growth establish OS/storage behavior; they do not qualify the Metal bridge
 or WebGL on the new OS version.
+
+## Additional Windows desktop field report
+
+The [Ryzen 7900X / RTX 5070 Tahoe report](windows-tahoe-rtx5070.md) records
+the paired guest/host desktop progress, CPU comparison limits, and the
+remaining Weather framebuffer-fetch and Maps ASTC failures.

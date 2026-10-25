@@ -470,3 +470,24 @@ header and doctest stages ran, but its test run remains incomplete on
 Windows: the unchanged C integration harness includes `sys/mman.h`. It is
 not reported as a green full suite. Bridge networking still needs a host
 with a configured TAP bridge for physical-network validation.
+
+## Desktop graphics setup and timed boot
+
+Fresh OpenCore configurations show the picker for five seconds and allow
+macOS to be saved as the default. To change an existing VM without
+regenerating its identity:
+
+```powershell
+./scripts/windows/prepare-opencore.ps1 -Rebuild -PickerTimeout 5
+```
+
+The command saves the previous plist. Select macOS with Ctrl+Enter once
+if it is not already the default. Existing configurations retain their
+current timeout unless `-PickerTimeout` is supplied; zero keeps the picker
+waiting for input.
+
+The experimental Tahoe bridge can be installed with
+`prepare-metal-compatibility.ps1`. Its [Windows setup instructions](../guest/metal-compat/README.md#prepare-the-bridge-on-windows)
+explain the source checks, backups and explicit global-routing option.
+This packages the graphics path used by the responsive test desktop; it
+does not fix Weather's framebuffer-fetch or Maps' ASTC format failure.
