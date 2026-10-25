@@ -662,6 +662,18 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
     /// ([`FirstUse::BlitCommand`]: measured for fills and copies, taken alike for the rest), and
     /// a reset or copy of an indirect command buffer is work for Metal's tiler
     /// ([`FirstUse::TilerBlit`]).
+    /// Into its command buffer's [`Progress`] ([`Progress::at_completion`]), whose completed
+    /// handler comes before every handler core adds: the queue makes it with the command buffer.
+    fn at_completion(&self, work: Box<dyn FnOnce() + Send>) -> bool {
+        match self.progress("addCompletedHandler:") {
+            Some(progress) => {
+                progress.at_completion(work);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn encode(&self, _on: OnFault, cmd: BlitCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         for (buffer, bytes) in named_buffers(&cmd) {

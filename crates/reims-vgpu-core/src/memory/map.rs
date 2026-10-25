@@ -33,6 +33,9 @@ pub struct MemoryMapRange {
 pub struct MemoryMap<P: Platform> {
     platform: Arc<P>,
     ranges: Vec<MemoryMapRange>,
+    /// Aliases kept for reuse where the platform's cost more than they give
+    /// (`HostVm::aliases_guest_in_place`): [`AliasCache`].
+    aliases: crate::sync::Mutex<AliasCache<P>>,
 }
 
 impl<P: Platform> std::fmt::Debug for MemoryMap<P> {
@@ -130,7 +133,11 @@ impl<P: Platform> MemoryMap<P> {
             return None;
         }
 
-        Some(Arc::new(MemoryMap { platform, ranges }))
+        Some(Arc::new(MemoryMap {
+            platform,
+            ranges,
+            aliases: crate::sync::Mutex::new(AliasCache::default()),
+        }))
     }
 
     /// A plain init (no validation): the same ranges.
@@ -138,6 +145,7 @@ impl<P: Platform> MemoryMap<P> {
         Arc::new(MemoryMap {
             platform: self.platform.clone(),
             ranges: self.ranges.clone(),
+            aliases: crate::sync::Mutex::new(AliasCache::default()),
         })
     }
 
@@ -270,12 +278,66 @@ impl<P: Platform> MemoryMap<P> {
         total_length: u64,
         read_only: u32,
     ) -> Option<Arc<Mapping<P>>> {
+        if !self.platform.vm().aliases_guest_in_place() {
+            return self.alias_ranges(ranges, total_length, read_only);
+        }
+        let key: AliasKey = (
+            ranges
+                .iter()
+                .map(|r| (r.physical_address, r.physical_length))
+                .collect(),
+            total_length,
+            read_only,
+        );
+        if let Some(mapping) = self.aliases.lock().get(&key) {
+            return Some(mapping);
+        }
+        let mapping = self.alias_ranges(ranges, total_length, read_only)?;
+        // A mapping of the map's own (one run, in place) costs nothing to make again.
+        if matches!(mapping.teardown(), Teardown::None) {
+            return Some(mapping);
+        }
+        let evicted = self.aliases.lock().insert(key, Arc::clone(&mapping));
+        // Unmapped here, outside the lock: an unmap costs as a map does.
+        drop(evicted);
+        Some(mapping)
+    }
+
+    /// [`new_range_mapping`](Self::new_range_mapping)'s mapping, made afresh.
+    fn alias_ranges(
+        &self,
+        ranges: &[PhysRange],
+        total_length: u64,
+        read_only: u32,
+    ) -> Option<Arc<Mapping<P>>> {
         let vm = self.platform.vm();
         // A total length of 0 passes the assert.
         crate::fatal_unless!(
             total_length % const { NonZeroU64::new(APV_PAGE_SIZE).unwrap() } == 0,
             DeathKind::MappingLengthUnaligned
         );
+        // One contiguous run of guest pages, inside one range, on a platform whose aliases cost
+        // more than they give (`HostVm::aliases_guest_in_place`): the map's own host mapping of
+        // them, which the host keeps, so the mapping tears nothing down. Its protection stays
+        // the host's: a read-only mapping is only read through.
+        if vm.aliases_guest_in_place() {
+            let mut runs = ranges.iter().filter(|r| r.physical_length != 0);
+            if let (Some(run), None) = (runs.next(), runs.next())
+                && run.physical_address != 0
+                && run.physical_length == total_length
+            {
+                let address =
+                    self.virtual_address_for_physical(run.physical_address, total_length);
+                if !address.is_null() {
+                    return Some(Mapping::new(
+                        address,
+                        total_length,
+                        read_only == 0,
+                        Teardown::None,
+                    ));
+                }
+            }
+        }
         let Ok(address) = vm.allocate_anywhere(total_length) else {
             return None;
         };
@@ -419,6 +481,78 @@ impl<P: Platform> MemoryMap<P> {
             crate::guest::GuestPtr::new(destination).copy_from(0, src, DeathKind::MapWriteNull);
         }
         true
+    }
+}
+
+/// Guest pages read and written through the memory map's own host mapping of guest RAM, one
+/// run of physical pages at a time, with no mapping made for them: for platforms where an alias
+/// costs more than copying its bytes (`HostVm::aliases_guest_in_place`). Offsets count from the
+/// first page of the first run.
+pub struct GuestPages<P: Platform> {
+    map: Arc<MemoryMap<P>>,
+    ranges: Vec<PhysRange>,
+    writable: bool,
+}
+
+impl<P: Platform> GuestPages<P> {
+    /// The runs `ranges` (in order) of `map`'s guest RAM; `writable` where no page is read-only.
+    pub fn new(map: Arc<MemoryMap<P>>, ranges: Vec<PhysRange>, writable: bool) -> Self {
+        GuestPages {
+            map,
+            ranges,
+            writable,
+        }
+    }
+
+    /// Whether every page is writable.
+    pub fn writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Visits the parts of `offset..offset + length` run by run, as (guest physical address,
+    /// offset into the request, length); false where the runs end first or `visit` refuses.
+    fn parts(&self, offset: u64, length: u64, mut visit: impl FnMut(u64, usize, usize) -> bool) -> bool {
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
+        let mut first = 0u64;
+        for range in &self.ranges {
+            let last = first.saturating_add(range.physical_length);
+            let (from, to) = (offset.max(first), end.min(last));
+            if from < to
+                && !visit(
+                    range.physical_address.wrapping_add(from - first),
+                    (from - offset).to_usize(),
+                    (to - from).to_usize(),
+                )
+            {
+                return false;
+            }
+            first = last;
+            if first >= end {
+                return true;
+            }
+        }
+        end <= first || length == 0
+    }
+
+    /// Copies the pages' bytes from `offset` into `dst`; false where a part has no host address.
+    pub fn read(&self, offset: u64, dst: &mut [u8]) -> bool {
+        self.parts(offset, dst.len().to_u64(), |physical, at, length| {
+            self.map.read(physical, &mut dst[at..at + length])
+        })
+    }
+
+    /// Copies `src` into the pages from `offset`; false (that part and the rest unwritten) where
+    /// a part has no host address.
+    pub fn write(&self, offset: u64, src: &[u8]) -> bool {
+        self.parts(offset, src.len().to_u64(), |physical, at, length| {
+            !self
+                .map
+                .virtual_address_for_physical(physical, length.to_u64())
+                .is_null()
+                && self.map.write(physical, &src[at..at + length])
+        })
     }
 }
 
@@ -1426,5 +1560,154 @@ mod tests {
             assert!(m.map_memory_at_virtual_address(dst, &[], false));
             assert_eq!(vm_calls(&p)[0].args[1], Arg::U64(0));
         }
+    }
+
+    mod guest_pages {
+        use super::*;
+
+        fn run(pa: u64, len: u64) -> PhysRange {
+            PhysRange {
+                physical_address: pa,
+                physical_length: len,
+            }
+        }
+
+        /// Two runs out of order: offsets count through the runs as they come.
+        fn scattered(p: &Arc<FakePlatform>) -> (GuestRam, GuestPages<FakePlatform>) {
+            let (ram, m) = ram_map(p, &[(0x4000, 4 * PAGE)]);
+            let pages = GuestPages::new(m, vec![run(0xc000, PAGE), run(0x4000, PAGE)], true);
+            (ram, pages)
+        }
+
+        #[test]
+        fn a_read_across_runs_follows_their_order() {
+            let p = plat();
+            let (ram, pages) = scattered(&p);
+            assert!(ram.write(0xc000 + PAGE - 3, &[1, 2, 3]));
+            assert!(ram.write(0x4000, &[4, 5]));
+            let mut got = [0u8; 5];
+            assert!(pages.read(PAGE - 3, &mut got));
+            assert_eq!(got, [1, 2, 3, 4, 5]);
+        }
+
+        #[test]
+        fn a_write_across_runs_lands_in_each() {
+            let p = plat();
+            let (ram, pages) = scattered(&p);
+            let bytes = pattern(8, 0x31);
+            assert!(pages.write(PAGE - 4, &bytes));
+            assert_eq!(ram.read_vec(0xc000 + PAGE - 4, 4).unwrap(), bytes[..4]);
+            assert_eq!(ram.read_vec(0x4000, 4).unwrap(), bytes[4..]);
+        }
+
+        #[test]
+        fn past_the_runs_is_refused() {
+            let p = plat();
+            let (_ram, pages) = scattered(&p);
+            let mut got = [0u8; 2];
+            assert!(!pages.read(2 * PAGE - 1, &mut got));
+            assert!(!pages.write(2 * PAGE, &[1]));
+        }
+
+        #[test]
+        fn a_run_outside_the_map_is_refused_without_a_write() {
+            let p = plat();
+            let (_ram, m) = ram_map(&p, &[(0x4000, PAGE)]);
+            let pages = GuestPages::new(m, vec![run(0x100_0000, PAGE)], true);
+            assert!(!pages.write(0, &[1, 2, 3]));
+        }
+    }
+}
+
+/// What [`AliasCache`] keys a mapping by: its ranges (physical address and length each, in
+/// order), its total length and whether it is read-only.
+type AliasKey = (Vec<(u64, u64)>, u64, u32);
+
+/// The most ranges [`AliasCache`] keeps aliased, a view each at most: about 256 MiB of 4 KiB
+/// pages, and as many views, which the process holds beside the guest's.
+const ALIAS_CACHE_RANGES: usize = 65_536;
+
+/// Mappings of guest pages kept for reuse, where an alias costs more than its pages are worth
+/// (`HostVm::aliases_guest_in_place`): core maps a texture's pages afresh for each command
+/// buffer that uses them, and on Windows a view made in QEMU's process cost about 10 ms, its
+/// unmap as much. A mapping aliases physical pages, so one made for the same ranges shows what
+/// they hold now, whenever it was made: reusing it is making it again. The least recently used
+/// go first past [`ALIAS_CACHE_RANGES`]; a mapping goes when its last holder drops it.
+pub(crate) struct AliasCache<P: Platform> {
+    entries: std::collections::HashMap<AliasKey, (Arc<Mapping<P>>, u64)>,
+    clock: u64,
+    ranges: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl<P: Platform> Default for AliasCache<P> {
+    fn default() -> Self {
+        AliasCache {
+            entries: std::collections::HashMap::new(),
+            clock: 0,
+            ranges: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+}
+
+impl<P: Platform> AliasCache<P> {
+    /// The mapping kept for `key`, marked used now.
+    fn get(&mut self, key: &AliasKey) -> Option<Arc<Mapping<P>>> {
+        self.clock = self.clock.wrapping_add(1);
+        let clock = self.clock;
+        let found = self.entries.get_mut(key).map(|(mapping, used)| {
+            *used = clock;
+            Arc::clone(mapping)
+        });
+        match found {
+            Some(_) => self.hits = self.hits.wrapping_add(1),
+            None => self.misses = self.misses.wrapping_add(1),
+        }
+        let lookups = self.hits.wrapping_add(self.misses);
+        if lookups.is_multiple_of(4096) {
+            log::info!(
+                "guest page aliases: {} of the last {lookups} lookups reused; {} mappings over {}                  ranges kept",
+                self.hits,
+                self.entries.len(),
+                self.ranges
+            );
+            self.hits = 0;
+            self.misses = 0;
+        }
+        found
+    }
+
+    /// Keeps `mapping` for `key`; answers the mappings it lets go, for the caller to drop
+    /// outside the lock.
+    fn insert(&mut self, key: AliasKey, mapping: Arc<Mapping<P>>) -> Vec<Arc<Mapping<P>>> {
+        let ranges = key.0.len();
+        let mut evicted = Vec::new();
+        if ranges > ALIAS_CACHE_RANGES {
+            return evicted;
+        }
+        while self.ranges.saturating_add(ranges) > ALIAS_CACHE_RANGES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some((old, _)) = self.entries.remove(&oldest) {
+                self.ranges = self.ranges.saturating_sub(oldest.0.len());
+                evicted.push(old);
+            }
+        }
+        self.clock = self.clock.wrapping_add(1);
+        if let Some((old, _)) = self.entries.insert(key, (mapping, self.clock)) {
+            evicted.push(old);
+        } else {
+            self.ranges = self.ranges.saturating_add(ranges);
+        }
+        evicted
     }
 }

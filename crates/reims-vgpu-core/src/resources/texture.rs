@@ -68,7 +68,14 @@ use std::sync::Arc;
 
 use zerocopy::{FromBytes, IntoBytes};
 
+use crate::guest::GuestPtr;
+use crate::memory::DeathKind as MemoryDeath;
+use crate::nil_send;
 use crate::num::ToUsize;
+use crate::platform::blit::BlitEncoder as _;
+use crate::platform::device::GpuDevice;
+use crate::platform::resource::Buffer as _;
+use crate::raise::OnFault;
 use crate::platform::resource::{GpuResource, Texture};
 use crate::platform::{Handle, Platform};
 use crate::raise::RaiseResult;
@@ -394,6 +401,114 @@ impl<P: Platform> PagedTexture<P> {
         let buffer = task.new_buffer_for_virtual_page(hold, self.page, self.length)?;
         *self.transfer_buffer.lock() = Some(buffer);
         Ok(())
+    }
+
+    /// [`Self::prepare`] for a layout paged by blits, its pages bound by
+    /// [`Self::bind_for_blits`]: `page` encodes the copies from the transfer buffer.
+    pub(crate) fn prepare_by_blits(
+        &self,
+        hold: Hold<'_>,
+        state: &ResourceState,
+        encoder: Option<&P::BlitEncoder>,
+        page: impl FnOnce() -> RaiseResult<()>,
+    ) -> RaiseResult<()> {
+        let staged = std::cell::Cell::new(false);
+        self.prepare(
+            state,
+            || self.bind_for_blits(hold, encoder, false, &staged),
+            || self.page_bound(&staged, page),
+        )
+    }
+
+    /// [`Self::synchronize`] for a layout paged by blits, as [`Self::prepare_by_blits`]: `page`
+    /// encodes the copies into the transfer buffer.
+    pub(crate) fn synchronize_by_blits(
+        &self,
+        hold: Hold<'_>,
+        state: &ResourceState,
+        encoder: Option<&P::BlitEncoder>,
+        page: impl FnOnce() -> RaiseResult<()>,
+    ) -> RaiseResult<()> {
+        let staged = std::cell::Cell::new(false);
+        self.synchronize(
+            state,
+            || self.bind_for_blits(hold, encoder, true, &staged),
+            || self.page_bound(&staged, page),
+        )
+    }
+
+    /// Binds the guest pages for one paging by blits. Where the platform's alias of scattered
+    /// guest pages costs more than copying them (`HostVm::aliases_guest_in_place`) and no
+    /// transfer buffer is held, the transfer buffer is, for this paging only, a fresh buffer
+    /// holding a copy of the pages, whose bytes a download copies into the pages once the
+    /// command buffer completed, before the guest hears of it (`BlitEncoder::at_completion`);
+    /// `staged` says so to [`Self::page_bound`]. Elsewhere, or where any of that is refused,
+    /// [`Self::ensure_physical`]. A nil encoder binds nothing where a paging would be staged.
+    fn bind_for_blits(
+        &self,
+        hold: Hold<'_>,
+        encoder: Option<&P::BlitEncoder>,
+        download: bool,
+        staged: &std::cell::Cell<bool>,
+    ) -> RaiseResult<()> {
+        if !self.platform.vm().aliases_guest_in_place() || self.transfer_buffer.lock().is_some() {
+            return self.ensure_physical(hold);
+        }
+        let Some(encoder) = encoder else {
+            return Ok(());
+        };
+        let Some(task) = self.task.upgrade() else {
+            crate::fatal!(DeathKind::GoneTaskPages)
+        };
+        let Some(pages) = task.guest_pages_for_virtual_page(hold, self.page, self.length)? else {
+            return self.ensure_physical(hold);
+        };
+        let Some(buffer) = nil_send!(
+            task.mtl_device(),
+            new_buffer_of_length(OnFault::Return, self.length, 0)
+        )?
+        else {
+            return self.ensure_physical(hold);
+        };
+        let mut bytes = vec![0u8; self.length.to_usize()];
+        if !pages.read(0, &mut bytes) {
+            log::warn!("texture pages without a host address: their paging copies zeros");
+        }
+        GuestPtr::new(buffer.contents()).copy_from(0, &bytes, MemoryDeath::MapWriteNull);
+        if download {
+            if !pages.writable() {
+                return self.ensure_physical(hold);
+            }
+            let written = buffer.clone_ref();
+            let length = self.length;
+            let back = Box::new(move || {
+                let mut bytes = vec![0u8; length.to_usize()];
+                GuestPtr::new(written.contents()).copy_to(0, &mut bytes, MemoryDeath::MapReadFault);
+                if !pages.write(0, &bytes) {
+                    log::warn!("a synchronized texture's guest page has no host address");
+                }
+            });
+            if !encoder.at_completion(back) {
+                return self.ensure_physical(hold);
+            }
+        }
+        *self.transfer_buffer.lock() = Some(buffer);
+        staged.set(true);
+        Ok(())
+    }
+
+    /// Runs `page`; a staged transfer buffer ([`Self::bind_for_blits`]) is then let go, held by
+    /// the command buffer until its copies ran.
+    fn page_bound(
+        &self,
+        staged: &std::cell::Cell<bool>,
+        page: impl FnOnce() -> RaiseResult<()>,
+    ) -> RaiseResult<()> {
+        let paged = page();
+        if staged.get() {
+            drop(self.transfer_buffer.lock().take());
+        }
+        paged
     }
 
     /// Drops the guest pages and makes the texture volatile; host-valid is kept.

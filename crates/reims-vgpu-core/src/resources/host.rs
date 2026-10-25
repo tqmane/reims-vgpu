@@ -13,6 +13,7 @@ use crate::deserializer::Deserializer;
 use crate::guest::records::FeaturesRef;
 use crate::host::HostPtr;
 use crate::memory::cursor::{Cursor, WritableCursor};
+use crate::memory::map::GuestPages;
 use crate::memory::mapping::Mapping;
 use crate::platform::Platform;
 use crate::raise::RaiseResult;
@@ -72,6 +73,19 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
         page: u32,
         length: u64,
     ) -> RaiseResult<P::Buffer>;
+
+    /// The guest's pages from `page`, `length` bytes, read and written through the memory map
+    /// with no mapping made ([`GuestPages`]); `None` where the task has no memory map, or (the
+    /// default) cannot answer them: a caller then makes a buffer over the pages.
+    fn guest_pages_for_virtual_page(
+        &self,
+        hold: Hold<'_>,
+        page: u32,
+        length: u64,
+    ) -> RaiseResult<Option<GuestPages<P>>> {
+        let _ = (hold, page, length);
+        Ok(None)
+    }
 
     /// Prepares an IOSurface backing. `encoder` is `None` when Metal gave no encoder, which
     /// nothing checks: the backing's validity writes still happen.
