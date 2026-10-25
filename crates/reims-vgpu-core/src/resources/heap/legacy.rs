@@ -152,7 +152,12 @@ impl<P: Platform> LegacyHeapResource<P> {
         let Some(tb) = tb else {
             return raise(RaiseKind::NoTransferBuffer);
         };
-        *self.transfer_buffer.lock() = Some(tb);
+        // A plain store: a buffer a racing caller stored between the check above and this
+        // store is overwritten unreleased, and kept for good with its GPU VA and its guest
+        // pages' mapping.
+        if let Some(raced) = self.transfer_buffer.lock().replace(tb) {
+            keep_forever(raced, Kept::MetalNumbering);
+        }
         Ok(())
     }
 
@@ -299,6 +304,32 @@ mod tests {
 
     fn encoder(env: &Env) -> Fk<kind::BlitEncoder> {
         env.p.world().new_obj::<kind::BlitEncoder>(Model::None)
+    }
+
+    /// A transfer buffer a racing caller (another FIFO's synchronize) stored between this
+    /// prepare's check and its store is overwritten unreleased: it stays live, with its GPU VA
+    /// and its guest pages' mapping, for good
+    #[test]
+    fn a_transfer_buffer_a_racing_caller_stored_is_kept() {
+        let env = Env::new();
+        let r = legacy(&env, 1).unwrap();
+        let enc = encoder(&env);
+        let racer = Arc::clone(&r);
+        let raced = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&raced);
+        env.rec.during_next("new_buffer_for_virtual_page", move || {
+            let k = parts(&racer);
+            k.ensure_physical(Hold::NONE).unwrap();
+            *seen.lock() = k.transfer_buffer.lock().as_ref().map(Handle::id);
+        });
+        r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+        let raced = raced.lock().take().expect("the racer stored a buffer");
+        let stored = parts(&r).transfer_buffer.lock().as_ref().map(Handle::id);
+        assert_ne!(stored, Some(raced));
+        assert!(
+            env.p.world().find(raced).is_some(),
+            "the raced buffer is kept"
+        );
     }
 
     mod init {

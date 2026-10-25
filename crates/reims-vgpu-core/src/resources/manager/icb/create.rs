@@ -1,6 +1,6 @@
 //! Creation of an ICB (object type 20): the object record, the creation command, the Metal
-//! descriptor of its serialized one, the placement's resource index checked and written back,
-//! and the resource over the new buffer.
+//! descriptor of its serialized one, the placement's resource ID checked and both words written
+//! back, and the resource over the new buffer.
 
 use zerocopy::IntoBytes;
 
@@ -81,9 +81,9 @@ type CreatedIcb<P> = (
 
 /// The ICB the creation command describes, made on the manager's device.
 ///
-/// With a placement, its resource ID (at +8) is set as the descriptor's resource index when
-/// nonzero, and its resource index (at +0), when nonzero, must come back as the new ICB's
-/// resource ID. On success the ICB's resource ID and then its resource index are written back.
+/// With a placement, its resource index (at +0) is set on the descriptor when its resource ID
+/// (at +8) is nonzero, and when the index is nonzero the new ICB's resource ID must be the
+/// placement's. On success the ICB's resource ID and then its resource index are written back.
 fn new_icb<P: Platform, M: ManagerOps<P>>(
     m: &M,
     cursor: &mut Cursor,

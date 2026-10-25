@@ -765,6 +765,8 @@ endpoint.lock         -> iosurface queue (sync)
                       (a surface retain holds the endpoint's lock across the IOSurface device's
                        lookup, which syncs onto its queue)
 device.displays       -> guest_display.guest_display_mutex (an attach or detach sets its client)
+device.displays       -> efi.present_queue (sync)
+                      (an EFI register write's mode rebuild stops presentation there)
 guest_display.guest_display_mutex -> display.display_mutex (a present)
 display.mode_list_update -> display.display_mutex -> display.guest_display
 display.mode_list_update -> guest_display.guest_display_mutex (set_mode_list, after the display's
@@ -784,6 +786,12 @@ Rules beyond the chains:
   to a `RemoteTask` drops inside a reply while a token is outstanding, its drain waits for a
   completion queued behind it on the same queue: a hang the host sees (`tasks/remote.rs`,
   `the_last_reference_in_a_reply_with_a_token_outstanding_hangs`).
+- **An EFI display that ends a display hangs, as Apple's does.** The display's end detaches it
+  under `device.displays`. A present that holds the last reference after the host's release ends
+  it on the present queue, while an EFI register write holds `device.displays` and syncs onto
+  that queue; a mode-count or mode-value read ends it under the `device.displays` its own thread
+  holds (`display/efi.rs`, testing.md 7.3,
+  `device::displays::tests::efi_display_holding_the_last_reference`).
 - **A FIFO delete's wait for the tasks' completions** counts them down under a lock of its own
   (`Countdown` in `device/fifos.rs`): the last completion notifies under that lock, and the wait
   checks the count and parks under it, so no completion is lost between the two.

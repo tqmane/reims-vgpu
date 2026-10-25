@@ -193,6 +193,9 @@ impl<P: Platform> DualPlaneCompute<P> {
         let buffer = task.new_buffer_for_virtual_page(hold, paged.page, paged.length)?;
         drop(task);
         let mut transfer = paged.transfer_buffer.lock();
+        // A buffer a racing caller stored between the check above and this store is let go
+        // here, but stays live for good: the racer's views over it, which the loop below
+        // overwrites without a release, hold it.
         let transfer_buffer = &*transfer.insert(buffer);
         // One descriptor for both planes: made from plane 0's value, then plane 1's size,
         // type and pixel format set on it.
@@ -660,6 +663,32 @@ mod tests {
             assert_ne!(
                 s.plane_textures.lock()[0].as_ref().unwrap().id(),
                 first.id()
+            );
+        }
+
+        /// A transfer buffer a racing caller stored between this call's check and its store
+        /// stays live, with its GPU VA and its guest pages' mapping, for good: the racer's views
+        /// over it, overwritten without a release, hold it
+        #[test]
+        fn a_transfer_buffer_a_racing_caller_stored_is_kept() {
+            let (e, _, _) = env();
+            let r = made(&e, 550);
+            let racer = Arc::clone(&r);
+            let raced = Arc::new(Mutex::new(None));
+            let seen = Arc::clone(&raced);
+            e.rec.during_next("new_buffer_for_virtual_page", move || {
+                let (tr, s) = parts(&racer);
+                s.ensure_physical(Hold::NONE, &tr.paged).unwrap();
+                *seen.lock() = tr.paged.transfer_buffer.lock().as_ref().map(Handle::id);
+            });
+            let (tr, s) = parts(&r);
+            s.ensure_physical(Hold::NONE, &tr.paged).unwrap();
+            let raced = raced.lock().take().expect("the racer stored a buffer");
+            let stored = tr.paged.transfer_buffer.lock().as_ref().map(Handle::id);
+            assert_ne!(stored, Some(raced));
+            assert!(
+                e.p.world().find(raced).is_some(),
+                "the raced buffer is kept"
             );
         }
 

@@ -3960,6 +3960,26 @@ behaviour.
 - The IOSurface host device's registers are 64-bit
   (`rvg_iosurface_device_mmio_read` and `_write` take a `uint64_t`); QEMU
   reads and writes them as 32 bits, and so does the runner (section 3.1).
+- The host's release of port 0's display while the EFI display holds it
+  hangs, where Apple's framework hangs. A present loads the bound display and
+  holds it to its end, so after the host's release the present ends the
+  display, and the display's detach takes the device's display lock. An EFI
+  register write (start, length, depth, mode or stride) holds that lock while
+  its rebuild waits for the present queue, so neither returns. A mode-count or
+  mode-value read holds the lock around its own load, so the display's end
+  there waits for a lock its own thread holds. **Read** in Apple's framework,
+  macOS 27.0.1 (26A434): `-[_PGDevice setEFIFramebufferMode:]` and its
+  siblings hold the device's display `std::mutex` across the EFI display's
+  call, and `getEFIModeCount` and `getEFIModeValue` hold it around theirs;
+  `-[PGEFIDisplay updateFramebufferMode]` `dispatch_sync`s onto the present
+  queue; `-[PGEFIDisplay present]` and `getModeCount` load the display with
+  `objc_loadWeak` inside an autorelease pool they pop at their end;
+  `-[_PGDisplay dealloc]` unplugs, and `detachDisplay:port:` locks the same
+  mutex. **Measured**: a Darwin `std::mutex` locked again by the thread that
+  holds it hangs (3 of 3 runs, M3 Max, macOS 27.0.1). No scenario locks it,
+  since the runner cannot place a host release inside a present; the unit
+  tests `device::displays::tests::efi_display_holding_the_last_reference`
+  reproduce both hangs with bounded waits.
 
 ### 7.4 Guest-triggerable crashes and hangs
 

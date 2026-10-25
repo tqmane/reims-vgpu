@@ -15,7 +15,7 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
-use crate::iosurface::IoSurfaceHostDevice;
+use crate::iosurface::{HostDeviceCore, IoSurfaceHostDevice};
 use crate::platform::Platform;
 
 /// The resumes that still report their stamp wait timeouts: the count after the increment must
@@ -28,8 +28,14 @@ pub struct ProcessState<P: Platform> {
     report_requests: AtomicU32,
     /// The display serial numbers in use. Membership only: never iterated.
     serial_nums: Mutex<Vec<u32>>,
-    /// The last IOSurface host device created, unretained.
-    iosurface_device: Mutex<Option<Weak<IoSurfaceHostDevice<P>>>>,
+    /// The last IOSurface host device created, and its state, both unretained.
+    iosurface_device: Mutex<Option<LatestIoSurfaceDevice<P>>>,
+}
+
+/// The last IOSurface host device created, and its state, both unretained.
+struct LatestIoSurfaceDevice<P: Platform> {
+    device: Weak<IoSurfaceHostDevice<P>>,
+    core: Weak<HostDeviceCore<P>>,
 }
 
 impl<P: Platform> std::fmt::Debug for ProcessState<P> {
@@ -76,9 +82,14 @@ impl<P: Platform> ProcessState<P> {
         &self.serial_nums
     }
 
-    /// Records `device` as the process's last IOSurface host device created.
-    pub(crate) fn register_iosurface_device(&self, device: Weak<IoSurfaceHostDevice<P>>) {
-        *self.iosurface_device.lock() = Some(device);
+    /// Records `device`, with `core` its state, as the process's last IOSurface host device
+    /// created.
+    pub(crate) fn register_iosurface_device(
+        &self,
+        device: Weak<IoSurfaceHostDevice<P>>,
+        core: Weak<HostDeviceCore<P>>,
+    ) {
+        *self.iosurface_device.lock() = Some(LatestIoSurfaceDevice { device, core });
     }
 
     /// The process's last IOSurface host device created, retained; `None` once its teardown has
@@ -87,7 +98,16 @@ impl<P: Platform> ProcessState<P> {
         self.iosurface_device
             .lock()
             .as_ref()
-            .and_then(Weak::upgrade)
+            .and_then(|latest| latest.device.upgrade())
+    }
+
+    /// The state of the process's last IOSurface host device created, unretained, while the
+    /// device is alive; `None` once its teardown has begun. The device itself is never
+    /// retained, so its teardown runs only on the thread that lets go of its last reference.
+    pub(crate) fn latest_iosurface_core(&self) -> Option<Weak<HostDeviceCore<P>>> {
+        let latest = self.iosurface_device.lock();
+        let latest = latest.as_ref()?;
+        (latest.device.strong_count() > 0).then(|| latest.core.clone())
     }
 }
 

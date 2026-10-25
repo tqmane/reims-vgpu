@@ -103,6 +103,8 @@ impl<P: Platform> MapperRefBufferResource<P> {
         };
         match buffer {
             Some(b) => {
+                // Never raced: only a CPU prepare makes it, and prepares run one at a time (the
+                // in-process task's prepare lock, the service's queue).
                 // The buffer holds the surface now.
                 *self.buffer.lock() = Some(b);
                 drop(surface);

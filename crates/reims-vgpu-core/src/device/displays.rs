@@ -1773,4 +1773,128 @@ mod tests {
             assert!(got.1.is_empty(), "{:?}", got.1);
         }
     }
+
+    /// The EFI display holding a display's last reference (testing.md 7.3): a host release of
+    /// the display while a present, or a mode-count read, holds it leaves the display's end to
+    /// that holder, and the end's detach waits for the device's display mutex. Each wait here is
+    /// bounded; the threads that hang stay behind, and the test's process ends with them.
+    mod efi_display_holding_the_last_reference {
+        use super::*;
+        use crate::host::HostQueue;
+        use crate::testkit::host::{FakeHostQueue, QueueMode};
+        use std::sync::mpsc;
+        use std::thread::ThreadId;
+        use std::time::Duration;
+
+        /// How long a hung call is given to return before the test calls it hung.
+        const HUNG: Duration = Duration::from_secs(1);
+        /// How long a step the test waits for may take.
+        const STEP: Duration = Duration::from_secs(10);
+
+        /// A display of the device's own on port 0, the EFI display's port, parked (no guest
+        /// display).
+        fn parked_on_port_0(t: &TestDevice) -> DisplayHandle<FakePlatform> {
+            let queue: Arc<dyn HostQueue> = FakeHostQueue::new(QueueMode::Manual);
+            let mut desc = DisplayDescriptor::sdk_defaults();
+            desc.queue = Some(queue);
+            let d = t.device.new_display(&desc, 0, 0x1234).expect("display");
+            assert!(t.device.displays.lock().display_client[0].is_some());
+            d
+        }
+
+        /// The thread the display's end begins on, sent as it begins.
+        fn end_begins(d: &DisplayHandle<FakePlatform>) -> mpsc::Receiver<ThreadId> {
+            let (tx, rx) = mpsc::channel();
+            d.core().drop_probe.lock().replace(Box::new(move || {
+                let _ = tx.send(std::thread::current().id());
+            }));
+            rx
+        }
+
+        /// Waits (`STEP` at most, in 1 ms steps) until `f` holds.
+        fn wait_until(what: &str, f: impl Fn() -> bool) {
+            for _ in 0..STEP.as_millis() {
+                if f() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("timed out waiting for {what}");
+        }
+
+        /// A present holds the display when the host releases it, while the guest's EFI mode
+        /// write holds the display mutex and waits for the present queue (its mode rebuild
+        /// stops presentation there): the present's end of the display waits for the mutex, and
+        /// neither returns.
+        #[test]
+        fn a_present_ending_the_display_under_a_register_write_deadlocks() {
+            let t = dev();
+            let host_display = parked_on_port_0(&t);
+            t.device.set_efi_display(1);
+            let efi = t.efi_display().expect("EFI display");
+            let (loaded_tx, loaded_rx) = mpsc::channel();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            efi.loaded_probe.lock().replace(Box::new(move || {
+                let _ = loaded_tx.send(std::thread::current().id());
+                let _ = go_rx.recv_timeout(STEP);
+            }));
+            let ended = end_begins(&host_display);
+            // A present, on the present queue.
+            efi.source.merge(1);
+            let presenter = loaded_rx
+                .recv_timeout(STEP)
+                .expect("the present loads the display");
+            // The host's release: the present holds the last reference now.
+            drop(host_display);
+            // The guest's mode write, on its vCPU's thread.
+            let (wrote_tx, wrote_rx) = mpsc::channel();
+            let device = Arc::clone(&t.device);
+            #[allow(clippy::disallowed_methods)] // test scaffolding: the guest's vCPU thread
+            std::thread::spawn(move || {
+                device.set_efi_framebuffer_mode(0x0010_0010);
+                let _ = wrote_tx.send(());
+            });
+            wait_until("the mode write to hold the display mutex", || {
+                t.device.displays.try_lock().is_none()
+            });
+            // The present goes on, and the display's end begins on the present queue.
+            go_tx.send(()).expect("the present waits");
+            assert_eq!(ended.recv_timeout(STEP), Ok(presenter));
+            assert_eq!(
+                wrote_rx.recv_timeout(HUNG),
+                Err(mpsc::RecvTimeoutError::Timeout),
+                "the mode write returned"
+            );
+            assert!(t.device.displays.try_lock().is_none());
+        }
+
+        /// A mode-count read holds the display mutex around its load of the display: a host
+        /// release meanwhile leaves the end to the read, whose detach waits for the mutex its
+        /// own thread holds, and the read never returns.
+        #[test]
+        fn a_mode_count_read_ending_the_display_deadlocks() {
+            let t = dev();
+            let host_display = parked_on_port_0(&t);
+            t.device.set_efi_display(1);
+            let efi = t.efi_display().expect("EFI display");
+            let ended = end_begins(&host_display);
+            // The host's release, inside the read's load.
+            efi.loaded_probe
+                .lock()
+                .replace(Box::new(move || drop(host_display)));
+            let (read_tx, read_rx) = mpsc::channel();
+            let device = Arc::clone(&t.device);
+            #[allow(clippy::disallowed_methods)] // test scaffolding: the guest's vCPU thread
+            let reader = std::thread::spawn(move || {
+                let _ = read_tx.send(device.get_efi_mode_count());
+            });
+            assert_eq!(ended.recv_timeout(STEP), Ok(reader.thread().id()));
+            assert_eq!(
+                read_rx.recv_timeout(HUNG),
+                Err(mpsc::RecvTimeoutError::Timeout),
+                "the mode-count read returned"
+            );
+            assert!(t.device.displays.try_lock().is_none());
+        }
+    }
 }

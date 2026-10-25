@@ -93,7 +93,9 @@ impl<P: Platform> HostDeviceCore<P> {
         let id = u64::from(mapping_id);
         let page_index = num::div0(id, st.descriptors_per_page);
         let within = num::rem0(id, st.descriptors_per_page);
-        // Never: an id below 8192 is on page 511 at most.
+        // The table has a page's worth of 4-byte entries. On a 16 KiB page an id below 8192 is
+        // on page 511 at most, inside its 4096; on a 4 KiB page the first form's ids stay
+        // inside its 1024 (page 1023 at most), and the second form's from 4096 on are past it.
         if page_index >= st.table_len {
             log::warn!(
                 "map: surface {mapping_id}'s descriptor page {page_index} is past the table's {} \
@@ -295,7 +297,7 @@ impl<P: Platform> HostDeviceCore<P> {
         }
         let id = u64::from(mapping_id);
         let page_index = num::div0(id, st.descriptors_per_page);
-        // Never: as in `map`.
+        // As in `map`: reached only by the second form's ids from 4096 on, on a 4 KiB page.
         if page_index >= st.table_len {
             log::warn!(
                 "unmap: surface {mapping_id}'s descriptor page {page_index} is past the table's \

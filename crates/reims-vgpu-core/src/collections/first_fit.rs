@@ -1,8 +1,10 @@
 //! [`FirstFitVa`]: first fit over a sorted free list, the root task's virtual address space.
 //!
 //! Its offsets reach the host as the `voff` of the root task's `mapMemory` and `unmapMemory`.
-//! Every size rounds to the granule with wrapping `u64` arithmetic, a free coalesces with both
-//! neighbours, and nothing checks that a freed range was allocated. The device never resets it:
+//! Every size rounds up to the granule. An allocation that would round or end past 2^64 fits
+//! nowhere and fails, as one larger than every free range does; a free rounds with wrapping `u64`
+//! arithmetic. A free coalesces with both neighbours, and nothing checks that a freed range was
+//! allocated. The device never resets it:
 //! a range that leaks at a root teardown stays allocated, and every later offset moves past it.
 
 /// One free range, `start..=last`.
@@ -33,22 +35,22 @@ impl FirstFitVa {
     }
 
     /// The start of the first free range that holds `size` rounded up to the granule, at its
-    /// first granule boundary. A size of 0 fails.
-    ///
-    /// A size within a granule of 2^64 rounds to 0. It then fits at the first free start above 0
-    /// without consuming anything, and fails at start 0, where `start + 0 - 1` wraps past every
-    /// range's end.
+    /// first granule boundary. A size of 0 fails, and so does one that rounds past 2^64; a range
+    /// whose boundary or block end would lie past 2^64 does not hold it. A failure changes
+    /// nothing.
     pub fn allocate(&mut self, size: u64) -> Option<u64> {
         if size == 0 {
             return None;
         }
         let mask = self.mask;
-        let asz = self.round(size);
+        let asz = size.checked_add(mask)? & !mask;
         let (i, range, al, end) = self.free.iter().enumerate().find_map(|(i, r)| {
-            let al = r.start.wrapping_add(mask) & !mask;
-            let end = al.wrapping_add(asz).wrapping_sub(1);
+            let al = r.start.checked_add(mask)? & !mask;
+            // `asz` is at least `size`, so at least 1.
+            let end = al.checked_add(asz.wrapping_sub(1))?;
             (end <= r.last).then_some((i, *r, al, end))
         })?;
+        // Used only when the block ends before the range does, so below 2^64.
         let after = al.wrapping_add(asz);
         match (al == range.start, end == range.last) {
             // The block fills the range.
@@ -242,20 +244,42 @@ mod tests {
         assert_eq!(a, root());
     }
 
+    /// A size that rounds past 2^64 fails wherever the free ranges start, and changes nothing.
     #[test]
-    fn a_huge_size_wraps_to_zero_and_fits_above_start_0() {
+    fn a_size_rounding_past_2_64_fails() {
         let mut a = root();
-        // At start 0 the wrapped size fails.
         assert_eq!(a.allocate(u64::MAX - 0x3ffe), None);
         assert_eq!(a.allocate(u64::MAX), None);
         assert_eq!(a, root());
         assert_eq!(a.allocate(0x4000), Some(0));
         let before = a.clone();
-        assert_eq!(a.allocate(u64::MAX - 0x3ffe), Some(0x4000));
-        assert_eq!(a.allocate(u64::MAX), Some(0x4000));
+        assert_eq!(a.allocate(u64::MAX - 0x3ffe), None);
+        assert_eq!(a.allocate(u64::MAX), None);
         assert_eq!(a, before);
-        // One below the wrap threshold rounds to 2^64 - 0x4000 and fails.
+    }
+
+    /// A block whose end would lie past 2^64 does not fit, wherever the range starts: the
+    /// allocation fails and changes nothing, as one larger than the space does.
+    #[test]
+    fn a_block_ending_past_2_64_fails() {
+        let mut a = root();
+        assert_eq!(a.allocate(0x8000), Some(0));
+        let before = a.clone();
+        // From 0x8000, 2^64 - 0x4000 bytes would end at 0x3fff after wrapping.
+        assert_eq!(a.allocate(0xffff_ffff_ffff_c000), None);
         assert_eq!(a.allocate(u64::MAX - 0x3fff), None);
+        assert_eq!(a, before);
+        assert_eq!(a.allocate(0x4000), Some(0x8000));
+    }
+
+    /// A free range that starts past the last granule boundary below 2^64 holds nothing: its
+    /// first boundary would lie past 2^64.
+    #[test]
+    fn a_range_whose_boundary_lies_past_2_64_holds_nothing() {
+        let mut a = FirstFitVa::new(u64::MAX, 0x4000);
+        a.free = vec![r(u64::MAX - 0xffe, u64::MAX)];
+        let before = a.clone();
+        assert_eq!(a.allocate(1), None);
         assert_eq!(a, before);
     }
 

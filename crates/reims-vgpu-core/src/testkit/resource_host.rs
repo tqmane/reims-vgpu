@@ -36,6 +36,9 @@ type P = FakePlatform;
 
 const CLASS: &str = "ResourceHost";
 
+/// A hook [`FakeResourceHost::during_next`] runs once, inside the next call of its selector.
+type During = (&'static str, Box<dyn FnOnce() + Send>);
+
 struct Shared {
     log: CallLog,
     script: Script,
@@ -43,6 +46,8 @@ struct Shared {
     features: Mutex<Option<FeaturesRef>>,
     provided: Mutex<Vec<(u64, AnyHandle)>>,
     paging_queue: Mutex<Option<Fk<kind::CommandQueue>>>,
+    /// What runs inside the next call of a selector, once (a racing caller's whole call).
+    during: Mutex<Vec<During>>,
 }
 
 /// A scripted task. Siblings share one log, script and state.
@@ -71,6 +76,7 @@ impl FakeResourceHost {
                 features: Mutex::new(None),
                 provided: Mutex::new(Vec::new()),
                 paging_queue: Mutex::new(None),
+                during: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -115,8 +121,22 @@ impl FakeResourceHost {
             .and_then(|(_, h)| h.cast::<K>())
     }
 
+    /// Runs `f` inside the next call of `sel`, once, after it is logged and before it answers:
+    /// another caller's whole call between this one's start and its answer, as when two threads
+    /// race through it.
+    pub fn during_next(&self, sel: &'static str, f: impl FnOnce() + Send + 'static) {
+        self.shared.during.lock().push((sel, Box::new(f)));
+    }
+
     fn step(&self, sel: &'static str, args: Vec<Arg>) -> Step {
         self.shared.log.push(ObjId(0), CLASS, sel, args);
+        let during = {
+            let mut g = self.shared.during.lock();
+            g.iter().position(|(s, _)| *s == sel).map(|i| g.remove(i).1)
+        };
+        if let Some(f) = during {
+            f();
+        }
         self.shared.script.next(ObjId(0), sel)
     }
 

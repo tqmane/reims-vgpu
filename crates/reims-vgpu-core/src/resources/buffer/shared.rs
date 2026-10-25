@@ -77,6 +77,8 @@ impl<P: Platform> SharedBufferResource<P> {
         let Some(buffer) = buffer else {
             return raise(RaiseKind::NoGuestBuffer);
         };
+        // Never raced: after the creation only a CPU prepare binds it, and prepares run one at
+        // a time (the in-process task's prepare lock, the service's queue).
         *self.buffer.lock() = Some(buffer);
         Ok(())
     }

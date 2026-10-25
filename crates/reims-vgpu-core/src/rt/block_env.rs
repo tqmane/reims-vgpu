@@ -5,7 +5,8 @@
 //! whatever handlers the thread had (measured for `dispatch_sync` on macOS 26.7). Its code holds
 //! under [`Hold::NONE`](crate::rt::Hold::NONE), with no holder: a callout is `Send` and its
 //! caller's hold is not, so none reaches it. While a queue's block runs, the thread owns the queue,
-//! and a `sync` onto a queue it owns dies. So a queue's block or a completion handler enters:
+//! and a `sync` onto a queue it owns runs its block at once, as a nested call (`rt::queue`'s
+//! module doc). So a queue's block or a completion handler enters:
 //! - the thread's ownership chain: the queue a worker's block is of, a sync caller's chain plus
 //!   the queue, none on a foreign thread;
 //! - the "ours" mark, so a panic there aborts before unwinding (6.5): on a platform worker, and

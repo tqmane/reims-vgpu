@@ -31,6 +31,16 @@
 //! `efi_teardown` and `efi_rebuild_conditions`; the device's own teardown is
 //! `tests::the_device_teardown_destroys_the_task_through_the_host`).
 //!
+//! **A display's last release here hangs, as in Apple's framework.** A present, and the
+//! mode-count and mode-value reads, load the bound display and hold it to their end, so a host
+//! release of the display meanwhile leaves its last reference there, and the display's end runs
+//! there: its unplug detaches it under the device's display mutex. A register write holds that
+//! mutex while its mode rebuild waits for the present queue, so a present that ends the display
+//! then waits for the mutex, and the register write for the present, for good; a mode-count or
+//! mode-value read holds the mutex around its own load, so its end waits for a lock its own
+//! thread holds. Apple's framework is built the same way, and hangs the same (testing.md 7.3;
+//! the tests are `device::displays::tests::efi_display_holding_the_last_reference`).
+//!
 //! **Raises.** No handler is live on any path into the EFI display: the register writes (and
 //! the device's binding, teardown and resume replay) run in the host's call, which has none, and
 //! a present in its block, which starts with none and holds under [`Hold::NONE`]. So every raise
@@ -189,6 +199,10 @@ pub struct EfiDisplay<P: Platform> {
     /// Its last release cancels it and drops what is pending (never cancelled otherwise).
     pub(crate) source: CoalescingSignal,
     platform: Arc<P>,
+    /// Runs once at the next load of the bound display, after the load and before anything the
+    /// loader does with it (tests).
+    #[cfg(test)]
+    pub(crate) loaded_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A send's or a present's value. No handler is live on any path into the EFI display (module
@@ -215,8 +229,19 @@ impl<P: Platform> EfiDisplay<P> {
                 state: Mutex::new(EfiState::new()),
                 source,
                 platform: platform.clone(),
+                #[cfg(test)]
+                loaded_probe: Mutex::new(None),
             }
         })
+    }
+
+    /// The probe of a load, once (tests).
+    #[cfg(test)]
+    fn after_load(&self) {
+        let probe = self.loaded_probe.lock().take();
+        if let Some(probe) = probe {
+            probe();
+        }
     }
 
     /// The source's handler: presents when the EFI display is alive, nothing once its last
@@ -490,6 +515,8 @@ impl<P: Platform> EfiDisplay<P> {
             self.stop_presenting();
             return;
         };
+        #[cfg(test)]
+        self.after_load();
         let Some(texture) = texture else { return };
         // The completion runs inside the present, and always signals.
         let completion_display = Arc::clone(&display);
@@ -516,7 +543,12 @@ impl<P: Platform> EfiDisplay<P> {
     /// The bound display, loaded (see [`EfiDisplay::loaded`]).
     fn load_display(&self) -> Option<(DisplayHandle<P>, Arc<Display<P>>)> {
         let display = self.state.lock().display.as_ref().and_then(Weak::upgrade)?;
-        Self::loaded(display)
+        let loaded = Self::loaded(display);
+        #[cfg(test)]
+        if loaded.is_some() {
+            self.after_load();
+        }
+        loaded
     }
 
     /// Binds `display` (weakly; `None` unbinds) and resets the mode select.

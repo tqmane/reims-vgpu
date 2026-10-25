@@ -71,7 +71,7 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::num::ToUsize;
 use crate::platform::resource::{GpuResource, Texture};
 use crate::platform::{Handle, Platform};
-use crate::raise::RaiseResult;
+use crate::raise::{Kept, RaiseResult, keep_forever};
 use crate::resources::resource::AnyResource;
 use crate::resources::resource::{
     PURGEABLE_EMPTY, PURGEABLE_NON_VOLATILE, PURGEABLE_VOLATILE, Resource, ResourceClass,
@@ -392,7 +392,12 @@ impl<P: Platform> PagedTexture<P> {
         };
         // The task raises rather than answer nothing.
         let buffer = task.new_buffer_for_virtual_page(hold, self.page, self.length)?;
-        *self.transfer_buffer.lock() = Some(buffer);
+        // A plain store: a buffer a racing caller stored between the check above and this
+        // store is overwritten unreleased, and kept for good with its GPU VA and its guest
+        // pages' mapping.
+        if let Some(raced) = self.transfer_buffer.lock().replace(buffer) {
+            keep_forever(raced, Kept::MetalNumbering);
+        }
         Ok(())
     }
 
@@ -921,6 +926,31 @@ mod tests {
             // A held transfer buffer is never rebound.
             b.ensure_physical(Hold::NONE).unwrap();
             assert_eq!(e.calls(m, "new_buffer_for_virtual_page").len(), 1);
+        }
+
+        /// A transfer buffer a racing caller stored between this call's check and its store is
+        /// overwritten unreleased: it stays live, with its GPU VA and its guest pages' mapping,
+        /// for good
+        #[test]
+        fn a_transfer_buffer_a_racing_caller_stored_is_kept() {
+            let e = Env::new();
+            let t = e.tex(desc(70, 4, 4, 1, 1), false);
+            let b = Arc::new(base(&e, &t));
+            let racer = Arc::clone(&b);
+            let raced = Arc::new(Mutex::new(None));
+            let seen = Arc::clone(&raced);
+            e.rec.during_next("new_buffer_for_virtual_page", move || {
+                racer.ensure_physical(Hold::NONE).unwrap();
+                *seen.lock() = racer.transfer_buffer.lock().as_ref().map(Handle::id);
+            });
+            b.ensure_physical(Hold::NONE).unwrap();
+            let raced = raced.lock().take().expect("the racer stored a buffer");
+            let stored = b.transfer_buffer.lock().as_ref().map(Handle::id);
+            assert_ne!(stored, Some(raced));
+            assert!(
+                e.p.world().find(raced).is_some(),
+                "the raced buffer is kept"
+            );
         }
 
         /// The task's raise propagates, nothing bound

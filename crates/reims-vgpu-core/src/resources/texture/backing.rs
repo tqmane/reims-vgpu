@@ -949,6 +949,31 @@ mod tests {
         );
     }
 
+    /// A transfer buffer a racing caller stored between this call's check and its store is
+    /// overwritten unreleased: it stays live, with its GPU VA and its guest pages' mapping, for
+    /// good
+    #[test]
+    fn a_transfer_buffer_a_racing_caller_stored_is_kept() {
+        let env = Env::new();
+        let r = make(&env);
+        r.discard().unwrap();
+        let racer = Arc::clone(&r);
+        let raced = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&raced);
+        env.rec.during_next("new_buffer_for_virtual_page", move || {
+            let b = backing(&racer);
+            b.ensure_physical(Hold::NONE).unwrap();
+            *seen.lock() = b.transfer_buffer.lock().as_ref().map(Handle::id);
+        });
+        let stored = backing(&r).ensure_physical(Hold::NONE).unwrap().id();
+        let raced = raced.lock().take().expect("the racer stored a buffer");
+        assert_ne!(stored, raced);
+        assert!(
+            env.p.world().find(raced).is_some(),
+            "the raced buffer is kept"
+        );
+    }
+
     /// The task's raise propagates; a gone task gives no buffer, which raises
     #[test]
     fn ensure_physical_failures() {
