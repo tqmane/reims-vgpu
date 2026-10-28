@@ -1389,9 +1389,17 @@ fn relay(message: &rt::DebugMessage) {
 /// gives a sink alone, goes to the log at debug instead, as the library's other diagnostics do:
 /// the runtime's line for each host import freed on a device that keeps MoltenVK's residency set
 /// (`metal2vulkan-host-import-freed`; this host's MoltenVK keeps it). A driver's or a layer's
-/// (`VK_EXT_debug_utils`), which the runtime reports to a sink alone, is dropped, as without one.
+/// (`VK_EXT_debug_utils`), which the runtime reports to a sink alone, is written only at severity
+/// `Error`, after its id name: MoltenVK's reason for a refusal the runtime answers with a bare
+/// `VkResult` (`mvk-error`, a shader the Metal compiler did not take, say) reaches stderr with
+/// nothing else; one of a lower severity is dropped. The runtime hands the sink none of the
+/// driver's messages its own self-checks provoke.
 fn relay_to(w: &mut impl std::io::Write, severity: rt::MessageSeverity, id_name: &str, text: &str) {
     if !id_name.starts_with(RUNTIME_MESSAGES) {
+        if severity == rt::MessageSeverity::Error {
+            // One write, so the line never interleaves with another thread's.
+            let _ = w.write_all(format!("{id_name}: {text}\n").as_bytes());
+        }
         return;
     }
     if severity == rt::MessageSeverity::Verbose {
@@ -1861,7 +1869,8 @@ mod tests {
     /// reservation's warning and its shader cache's warnings of an entry evicted and one not
     /// written, reach stderr's writer as the runtime writes them without a sink, a line each,
     /// unchanged, and so does a degradation it announces; its own `Verbose` line of a host import
-    /// freed goes to the log alone, and a layer's and a driver's are dropped
+    /// freed goes to the log alone; a layer's and a driver's error reaches it after its id name,
+    /// and their messages of a lower severity are dropped
     #[test]
     fn the_runtimes_own_messages_are_relayed_unchanged() {
         use rt::MessageSeverity as S;
@@ -1895,6 +1904,11 @@ mod tests {
                 "MoltenVK: a verbose message of the driver's",
             ),
             (
+                S::Error,
+                "mvk-error",
+                "VK_ERROR_INITIALIZATION_FAILED: Shader library compile failed (Error code 3):",
+            ),
+            (
                 S::Warning,
                 "metal2vulkan-degrade-shadowed-texture",
                 degraded,
@@ -1902,9 +1916,15 @@ mod tests {
         ] {
             relay_to(&mut out, severity, id_name, text);
         }
+        let validation = "VUID-RuntimeSpirv-None-06343: Validation Error: \
+                          [ VUID-RuntimeSpirv-None-06343 ]";
+        let compile = "mvk-error: VK_ERROR_INITIALIZATION_FAILED: Shader library compile \
+                       failed (Error code 3):";
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!("{creation}\n{late}\n{evicted}\n{unwritten}\n{degraded}\n")
+            format!(
+                "{creation}\n{validation}\n{late}\n{evicted}\n{unwritten}\n{compile}\n{degraded}\n"
+            )
         );
     }
 
