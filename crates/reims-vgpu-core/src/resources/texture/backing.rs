@@ -6,11 +6,15 @@ use std::sync::Arc;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::guest::GuestPtr;
+use crate::memory::DeathKind;
+use crate::memory::map::GuestPages;
 use crate::nil_send;
-use crate::num::ToU64;
+use crate::num::{ToU64, ToUsize};
 use crate::platform::blit::{BlitCmd, BlitEncoder};
 use crate::platform::descriptor::TextureDescriptor;
 use crate::platform::device::GpuDevice;
+use crate::platform::resource::Buffer as _;
 use crate::platform::os::surface::{BackingPlaneSpec, BackingSurfaceSpec};
 use crate::platform::types::{MtlOrigin, MtlSize};
 use crate::platform::values::TextureDesc;
@@ -114,8 +118,13 @@ pub struct BackingResource<P: Platform> {
     io_surface: Option<P::Surface>,
     /// The validated planes.
     planes: Vec<BackingPlane>,
-    /// The guest pages: dropped by a discard, bound again by the next paging.
+    /// The guest pages: dropped by a discard, bound again by the next paging. Never made where
+    /// the paging is [`Self::staged`].
     transfer_buffer: Mutex<Option<P::Buffer>>,
+    /// Whether a paging copies the guest pages through a fresh buffer of its own instead of a
+    /// buffer over them: where the platform's alias of scattered guest pages costs more than
+    /// copying them (`HostVm::aliases_guest_in_place`; a window's surface is a thousand pages).
+    staged: bool,
     /// One texture per plane over the IOSurface.
     textures: Vec<P::Texture>,
     /// The guest pages' length.
@@ -171,9 +180,11 @@ impl<P: Platform> BackingResource<P> {
                 height: own.first().map_or(0, |p| p.height),
             };
             let io_surface = platform.surfaces().create_backing(&spec);
+            let staged = platform.vm().aliases_guest_in_place();
             // A torn-down task answers nothing: no buffer.
             let host = task.upgrade();
             let transfer_buffer = match &host {
+                Some(_) if staged => None,
                 Some(t) => match t.new_buffer_for_virtual_page(hold, page, length) {
                     Ok(b) => Some(b),
                     Err(e) => {
@@ -183,11 +194,10 @@ impl<P: Platform> BackingResource<P> {
                         return Err(e);
                     }
                 },
-                None => None,
-            };
-            let Some(transfer_buffer) = transfer_buffer else {
-                drop(io_surface);
-                return crate::resources::raise(crate::resources::RaiseKind::NoGuestBuffer);
+                None => {
+                    drop(io_surface);
+                    return crate::resources::raise(crate::resources::RaiseKind::NoGuestBuffer);
+                }
             };
             let mut textures: Vec<P::Texture> = Vec::with_capacity(plane_count);
             // One descriptor for every plane: made from the first plane's value, then each later
@@ -251,7 +261,8 @@ impl<P: Platform> BackingResource<P> {
                     task,
                     io_surface,
                     planes: own,
-                    transfer_buffer: Mutex::new(Some(transfer_buffer)),
+                    transfer_buffer: Mutex::new(transfer_buffer),
+                    staged,
                     textures,
                     length,
                     page,
@@ -285,6 +296,27 @@ impl<P: Platform> BackingResource<P> {
         Ok(copy)
     }
 
+    /// The guest pages and a fresh shared buffer of their length, for a [`Self::staged`]
+    /// paging; `None` where the paging is not staged, the task answers no pages (a buffer over
+    /// them is used then) or Metal makes no buffer. A torn-down task raises, as for the buffer
+    /// over the pages.
+    fn staging(&self, hold: Hold<'_>) -> RaiseResult<Option<(GuestPages<P>, P::Buffer)>> {
+        if !self.staged {
+            return Ok(None);
+        }
+        let Some(task) = self.task.upgrade() else {
+            return crate::resources::raise(crate::resources::RaiseKind::NoGuestBuffer);
+        };
+        let Some(pages) = task.guest_pages_for_virtual_page(hold, self.page, self.length)? else {
+            return Ok(None);
+        };
+        let buffer = nil_send!(
+            task.mtl_device(),
+            new_buffer_of_length(OnFault::Return, self.length, 0)
+        )?;
+        Ok(buffer.map(|b| (pages, b)))
+    }
+
     /// The IOSurface.
     pub fn io_surface(&self) -> Option<P::Surface> {
         self.io_surface.as_ref().map(Handle::clone_ref)
@@ -308,6 +340,37 @@ fn pixel_format(plane: &BackingPlane) -> u64 {
         other => {
             log::warn!("backing plane of {other} bytes per element has no pixel format");
             PIXEL_FORMAT_INVALID
+        }
+    }
+}
+
+/// The plane rows a synchronize's copies wrote into `staging`, copied into the guest `pages`
+/// (only the rows' pixels, as the copies into a buffer over the pages wrote only those). Pages
+/// that are read-only, or a part with no host address, are logged and left as they are.
+fn write_back_rows<P: Platform>(
+    pages: &GuestPages<P>,
+    staging: &P::Buffer,
+    planes: &[BackingPlane],
+    length: u64,
+) {
+    if !pages.writable() {
+        log::warn!("a synchronized backing's guest pages are read-only: they keep their bytes");
+        return;
+    }
+    let mut bytes = vec![0u8; length.to_usize()];
+    GuestPtr::new(staging.contents()).copy_to(0, &mut bytes, DeathKind::MapReadFault);
+    for plane in planes {
+        let row = u64::from(plane.width).wrapping_mul(u64::from(plane.bytes_per_element()));
+        for y in 0..u64::from(plane.height) {
+            let at = u64::from(plane.offset)
+                .wrapping_add(y.wrapping_mul(u64::from(plane.bytes_per_row())));
+            let Some(end) = at.checked_add(row).filter(|&end| end <= length) else {
+                break;
+            };
+            if !pages.write(at, &bytes[at.to_usize()..end.to_usize()]) {
+                log::warn!("a synchronized backing's guest page has no host address");
+                return;
+            }
         }
     }
 }
@@ -365,7 +428,23 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
         if !state.guest_valid() {
             log::warn!("preparing a backing whose guest copy is not valid");
         }
-        let transfer_buffer = self.ensure_physical(hold)?;
+        // Staged: the guest pages are copied into a buffer of the paging's own now, which the
+        // command buffer holds until its copies ran.
+        let staged = match encoder {
+            Some(_) => self.staging(hold)?,
+            None => None,
+        };
+        let transfer_buffer = match staged {
+            Some((pages, staging)) => {
+                let mut bytes = vec![0u8; self.length.to_usize()];
+                if !pages.read(0, &mut bytes) {
+                    log::warn!("backing pages without a host address: its prepare copies zeros");
+                }
+                GuestPtr::new(staging.contents()).copy_from(0, &bytes, DeathKind::MapWriteNull);
+                staging
+            }
+            None => self.ensure_physical(hold)?,
+        };
         let buffer = &transfer_buffer;
         for (plane, texture) in self.planes.iter().zip(&self.textures) {
             // The form without options.
@@ -407,7 +486,30 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
         if !state.host_valid() {
             log::warn!("synchronizing a backing whose host copy is not valid");
         }
-        let transfer_buffer = self.ensure_physical(hold)?;
+        // Staged: the copies land in a buffer of the paging's own, whose plane rows are copied
+        // into the guest pages once the command buffer completed, before the guest hears of it.
+        let staged = match encoder {
+            Some(e) => match self.staging(hold)? {
+                Some((pages, staging)) => {
+                    let rows = staging.clone_ref();
+                    let planes = self.planes.clone();
+                    let length = self.length;
+                    if e.at_completion(Box::new(move || {
+                        write_back_rows(&pages, &rows, &planes, length);
+                    })) {
+                        Some(staging)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let transfer_buffer = match staged {
+            Some(staging) => staging,
+            None => self.ensure_physical(hold)?,
+        };
         let buffer = &transfer_buffer;
         for (plane, texture) in self.planes.iter().zip(&self.textures) {
             nil_send!(
@@ -978,6 +1080,7 @@ mod tests {
             textures: Vec::new(),
             length: 4,
             page: 0,
+            staged: false,
         };
         let e = lone.ensure_physical(hold).err().unwrap();
         assert_eq!(

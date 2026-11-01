@@ -160,9 +160,10 @@ impl SharedSingle {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.prepare(
+        paged.prepare_by_blits(
+            hold,
             state,
-            || paged.ensure_physical(hold),
+            encoder,
             || self.page(paged, encoder, false),
         )
     }
@@ -175,9 +176,10 @@ impl SharedSingle {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.synchronize(
+        paged.synchronize_by_blits(
+            hold,
             state,
-            || paged.ensure_physical(hold),
+            encoder,
             || self.page(paged, encoder, true),
         )
     }
@@ -281,9 +283,10 @@ impl SharedDual {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.prepare(
+        paged.prepare_by_blits(
+            hold,
             state,
-            || paged.ensure_physical(hold),
+            encoder,
             || self.page(paged, encoder, false),
         )
     }
@@ -296,9 +299,10 @@ impl SharedDual {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.synchronize(
+        paged.synchronize_by_blits(
+            hold,
             state,
-            || paged.ensure_physical(hold),
+            encoder,
             || self.page(paged, encoder, true),
         )
     }

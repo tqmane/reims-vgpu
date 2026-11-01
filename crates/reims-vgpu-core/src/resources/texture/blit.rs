@@ -242,9 +242,10 @@ impl SinglePlane {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.prepare(
+        paged.prepare_by_blits(
+            hold,
             state,
-            || paged.ensure_physical(hold),
+            encoder,
             || {
                 self.page(paged, encoder, false)?;
                 if self.generate_mipmaps {
@@ -271,9 +272,10 @@ impl SinglePlane {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.synchronize(
+        paged.synchronize_by_blits(
+            hold,
             state,
-            || paged.ensure_physical(hold),
+            encoder,
             || self.page(paged, encoder, true),
         )
     }
@@ -378,9 +380,10 @@ impl DualPlaneBlit {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.prepare(
+        paged.prepare_by_blits(
+            hold,
             state,
-            || paged.ensure_physical(hold),
+            encoder,
             || self.page(paged, encoder, false),
         )
     }
@@ -393,9 +396,10 @@ impl DualPlaneBlit {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.synchronize(
+        paged.synchronize_by_blits(
+            hold,
             state,
-            || paged.ensure_physical(hold),
+            encoder,
             || self.page(paged, encoder, true),
         )
     }

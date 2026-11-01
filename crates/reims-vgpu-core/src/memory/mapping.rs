@@ -100,6 +100,11 @@ impl<P: Platform> Mapping<P> {
     pub fn writable(&self) -> bool {
         self.writable
     }
+
+    /// What tears the range down when the mapping drops.
+    pub(crate) fn teardown(&self) -> &Teardown<P> {
+        &self.teardown
+    }
 }
 
 impl<P: Platform> Drop for Mapping<P> {

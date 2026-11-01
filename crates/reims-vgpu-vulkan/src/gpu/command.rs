@@ -926,7 +926,7 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
         get("commandBuffer", || {
             raw.add_submission_handler(tiler_handler(&tiler))
         });
-        Ok(Some(Obj::new(CommandBufferObject {
+        let command_buffer = Obj::new(CommandBufferObject {
             raw,
             device: self.device.clone_ref(),
             open_encoders: Arc::default(),
@@ -940,7 +940,12 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             hangs: Arc::clone(&self.hangs),
             hold: Mutex::new(None),
             executions: Mutex::new(Vec::new()),
-        })))
+        });
+        // Its progress now, so its completed handler is the first: a change an encoder adds
+        // (`BlitEncoder::at_completion`) then runs before every handler core adds, even one core
+        // added before it encoded.
+        command_buffer.progress("commandBuffer");
+        Ok(Some(command_buffer))
     }
 
     fn set_label(&self, label: &str) {

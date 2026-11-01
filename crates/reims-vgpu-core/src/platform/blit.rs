@@ -344,4 +344,13 @@ pub trait BlitEncoder<P: Platform>: Handle {
     /// Sends one [`BlitCmd`]. `on` says what a raise in a command reached both under a handler
     /// and with none (`EndEncoding`) does; the other commands are reached one way only.
     fn encode(&self, on: OnFault, cmd: BlitCmd<'_, P>) -> RaiseResult<()>;
+
+    /// Runs `work` once the encoder's command buffer completes, before every completed handler
+    /// core adds to it, whenever core added them (so before the guest hears of the completion);
+    /// `work` is dropped unrun where the command buffer fails or goes uncommitted. False where
+    /// the platform cannot, `work` dropped: a caller then keeps the guest's pages aliased.
+    fn at_completion(&self, work: Box<dyn FnOnce() + Send>) -> bool {
+        drop(work);
+        false
+    }
 }
