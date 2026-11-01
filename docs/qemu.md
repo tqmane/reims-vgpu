@@ -1758,3 +1758,42 @@ disk and firmware booted macOS after restricting the installed macOS
 profile to APFS/HFS discovery (`ScanPolicy=0x301`). This boot and the disk
 growth establish OS/storage behavior; they do not qualify the Metal bridge
 or WebGL on the new OS version.
+
+### Windows high-density capture measurements (2026-11-01)
+
+An O+ Connect extended display offered 1696x1200 logical points at
+3392x2400 pixels and 60 Hz alongside a 1920x1080 main display. The
+capture/linear-copy path can request about 62 MiB of scratch space for
+two BGRA snapshots. The runtime previously dedicated allocations above
+half its 64 MiB pool block, even when a request fit a whole block.
+Runtime `7f09d6be` pools those requests and retains the largest single idle
+block per pool; requests above a whole block and explicit apart allocations
+remain dedicated. The authored native Vulkan check kept a 17 MiB buffer
+live and recreated warmed 48 MiB and 64 MiB buffers eight times without
+another native allocation. Its former 48 MiB path allocated another
+384 MiB. This measures allocation reuse, not guest frame rate.
+
+The same runtime removes retired blocks from allocator bookkeeping under
+its mutex and releases their native memory after unlocking. Destruction is
+still synchronous and precedes the caller's deallocator callbacks. The
+CPU guard checks that the native release callback can take that mutex;
+the change does not remove the cost of a native free.
+
+Reims `28979c8c` with this runtime completed the Windows check's 2918 tests
+and doc-tests. One resolve death test failed under the full run's load,
+passed alone, and the interrupted remainder passed separately. The GNU
+Release build preserved the header and cached option ROM. The resulting
+16 GiB WHPX macOS 26.7.1 guest reached the desktop and both displays with
+no `reims-vgpu: fatal` line during the comparison.
+
+An authored ordinary AppKit window on each display requested a 60 Hz
+movement timer for 20 seconds. It delivered 197 timer callbacks over
+21.176 seconds; these are timer deliveries, not displayed FPS. The logged
+cumulative own native-memory allocation counter increased by 860405760
+bytes over the sampled interval, with 86 linear-copy passes. That counter
+is allocation traffic, not resident VRAM. Slow native buffer releases still
+reached 1340.4 ms. High-density motion therefore remains slow; the run does
+not qualify smoothness or establish an end-to-end speedup. The low-density
+comparison's transport timed out. Subsequent inventory confirmed the
+original 3392x2400 extension and unchanged main display, and the managed
+restore reported no outstanding display optimization.
