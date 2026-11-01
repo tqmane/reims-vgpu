@@ -221,7 +221,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metal2vulkan"
 version = "0.2.0"
-source = "git+https://github.com/tqmane/metal2vulkan?rev=9d6506af68922fe5ff1b9f378f77fbc558834ef9#9d6506af68922fe5ff1b9f378f77fbc558834ef9"
+source = "git+https://github.com/tqmane/metal2vulkan?rev=15a85b4aef69f14b7e5b16b58bb47c24e2e6d7d5#15a85b4aef69f14b7e5b16b58bb47c24e2e6d7d5"
 dependencies = [
  "ash",
  "metal2vulkan-air",
@@ -232,7 +232,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-air"
 version = "0.2.0"
-source = "git+https://github.com/tqmane/metal2vulkan?rev=9d6506af68922fe5ff1b9f378f77fbc558834ef9#9d6506af68922fe5ff1b9f378f77fbc558834ef9"
+source = "git+https://github.com/tqmane/metal2vulkan?rev=15a85b4aef69f14b7e5b16b58bb47c24e2e6d7d5#15a85b4aef69f14b7e5b16b58bb47c24e2e6d7d5"
 dependencies = [
  "sha2",
 ]
@@ -240,7 +240,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-runtime"
 version = "0.2.0"
-source = "git+https://github.com/tqmane/metal2vulkan?rev=9d6506af68922fe5ff1b9f378f77fbc558834ef9#9d6506af68922fe5ff1b9f378f77fbc558834ef9"
+source = "git+https://github.com/tqmane/metal2vulkan?rev=15a85b4aef69f14b7e5b16b58bb47c24e2e6d7d5#15a85b4aef69f14b7e5b16b58bb47c24e2e6d7d5"
 dependencies = [
  "ash",
  "libc",
