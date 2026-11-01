@@ -123,6 +123,8 @@ c=plistlib.loads(target.read_bytes()); policy=c['Misc']['Security']['ScanPolicy'
 assert policy & 1 and policy & (1<<8) and policy & (1<<9)
 assert not policy & (1<<10), 'OpenCore FAT/ESP bootstrap must not become the default OS'
 assert c['Misc']['Security']['SecureBootModel']=='x86legacy'
+assert c['Misc']['Boot']['Timeout']==5 and c['Misc']['Boot']['ShowPicker']
+assert c['Misc']['Security']['AllowSetDefault']
 assert c['NVRAM']['Add']['7C436110-AB2A-4BBB-A880-FE41995C9F82']['csr-active-config']==bytes(4)
 '@
     $baseTestPath = Join-Path $testRoot 'base-patch-test.py'

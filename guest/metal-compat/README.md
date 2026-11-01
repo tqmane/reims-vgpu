@@ -108,3 +108,34 @@ attempting to DMA-wire the same pages again (`prepare()` returned unsupported).
 Remaining qualification includes mip/slice preservation and
 resource cleanup under failure, WindowServer, guest restart and a matched
 TestUFO performance comparison.
+
+## Prepare the bridge on Windows
+
+The bridge is experimental. Use a disposable VM with the matching host
+runtime. The pinned build in the [Windows field report](../../docs/windows-tahoe-rtx5070.md)
+failed in Weather and Maps; newer renderer fixes are being retested. The Windows
+setup below is restricted to the tested Darwin 25.6.0 kernel. It does not
+change the CPU allocation, machine identity, SIP or AMFI.
+
+Build the bundle from a committed source snapshot as described above, then
+copy the whole `ReimsMetalCompat.kext` back to Windows. Keep its embedded
+`Contents/Resources/source-manifest.json`. With the VM stopped and Lilu
+1.7.2 or newer installed in its OpenCore image, run:
+
+```powershell
+./scripts/windows/prepare-metal-compatibility.ps1 -KextDirectory C:/lab/ReimsMetalCompat.kext -Routing Global
+```
+
+The command checks that the source manifest matches a complete committed
+snapshot in this checkout. This checks source provenance; it is not a
+reproducible-build or code-signature verification of the executable.
+It installs a versioned bundle after Lilu, enables `-reimsmetal` and rebuilds
+OpenCore. Existing bundles remain in place. A failed rebuild restores the
+previous configuration, image and preparation manifest. The backup folder
+is printed on completion; retain it with the VM checkpoint.
+
+Use `-Routing Diagnostic` to prepare the diagnostic connection without
+routing ordinary apps through the bridge. Run `REIMSTOOLS/setup.command`
+inside the guest to apply the existing Metal preference and guest power
+settings, then restart macOS. Global routing remains an explicit choice;
+it is not enabled for every new VM.

@@ -4,7 +4,7 @@ $testRoot=Join-Path $ProjectRoot ('.work/tmp/opencore-settings-'+[guid]::NewGuid
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
     $scripts=Split-Path $PSScriptRoot
-    foreach ($item in @(@('prepare-opencore.ps1','import json, pathlib, plistlib, re, sys, uuid','identity.py'),@('prepare-update-compatibility.ps1','import pathlib, plistlib, sys','updates.py'))) {
+    foreach ($item in @(@('prepare-opencore.ps1','import json, pathlib, plistlib, re, sys, uuid','identity.py'),@('prepare-update-compatibility.ps1','import pathlib, plistlib, sys','updates.py'),@('prepare-opencore.ps1','import plistlib, pathlib, sys','picker.py'))) {
         $ast=[scriptblock]::Create((Get-Content -Raw (Join-Path $scripts $item[0]))).Ast
         $prefix=$item[1]
         $code=$ast.Find({param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value.StartsWith($prefix)},$true).Value
@@ -40,7 +40,19 @@ assert c['NVRAM']['Add'][guid]['boot-args']=='-v keepsyms=1 revpatch=sbvmm revbl
 assert c['Kernel']['Quirks']['DisableLinkeditJettison']
 source.write_bytes(dest.read_bytes()); run('updates.py',source,dest)
 assert plistlib.loads(dest.read_bytes())==c
-print('SMBIOS validation and idempotent update configuration passed.')
+c['Misc']['Boot']={'Timeout':0,'ShowPicker':False,'Other':'keep'}
+source.write_bytes(plistlib.dumps(c)); before=source.read_bytes()
+run('picker.py',source,dest,5); chosen=plistlib.loads(dest.read_bytes())
+expected=copy.deepcopy(c); expected['Misc']['Boot'].update(Timeout=5,ShowPicker=True)
+expected['Misc']['Security']['AllowSetDefault']=True
+assert chosen==expected and source.read_bytes()==before
+for value in (-1,61):
+ previous=dest.read_bytes()
+ try: run('picker.py',source,dest,value)
+ except AssertionError: pass
+ else: raise AssertionError('Invalid picker timeout accepted')
+ assert dest.read_bytes()==previous and source.read_bytes()==before
+print('SMBIOS, update compatibility and boot picker checks passed.')
 '@
     $test | & (Get-ReimsTool 'python.exe') - $testRoot
     if ($LASTEXITCODE -ne 0) { throw 'OpenCore settings checks failed.' }
