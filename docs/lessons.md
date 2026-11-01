@@ -101,3 +101,13 @@ one. A new trap found the same way goes here.
   versions before compiling, and use a fresh target when toolchains have
   already mixed. Preserve the failed logs and release outputs rather than
   deleting a working engine to repair a validation cache.
+
+## A sibling workspace under this checkout inherits Clippy configuration
+
+Clippy walks parent directories when a workspace has no configuration file.
+A nested metal2vulkan checkout therefore picked up this repository's house
+clock restrictions and rejected its unchanged work-budget code. For that
+workspace's checks, set `CLIPPY_CONF_DIR` to a directory containing its own
+configuration (an empty file selects its normal defaults); an empty directory
+still permits the parent search. Keep warnings denied and do not alter the
+sibling's code to satisfy an unrelated workspace policy.
