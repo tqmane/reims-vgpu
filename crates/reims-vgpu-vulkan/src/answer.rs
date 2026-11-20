@@ -1439,6 +1439,13 @@ pub fn decide_describing<T>(
         Error::Invalid(_) if policy != Policy::Dies => {
             policy.on().throw(Raise::platform(sel).with_detail(line))
         }
+        _ if !strict() && policy != Policy::Dies && policy != Policy::Fatal => {
+            log::error!(
+                target: "reims_vgpu_vulkan::answer",
+                "platform call {sel} skipped with error (non-fatal): {line}"
+            );
+            policy.on().throw(Raise::platform(sel).with_detail(line))
+        }
         _ => dies(sel, &line),
     }
 }
@@ -2691,6 +2698,16 @@ mod tests {
             create("newFence", Policy::Caught, Nil::Never, || Ok(1)),
             Ok(Some(1))
         );
+        let non_fatal = relaxed(|| {
+            decide::<()>(
+                "drawPrimitives:vertexStart:vertexCount:",
+                Policy::Caught,
+                Error::Unsupported(metal2vulkan::error::Unsupported::not_implemented(
+                    metal2vulkan::error::Feature::UnknownIntrinsic,
+                )),
+            )
+        });
+        assert!(non_fatal.is_err());
     }
 
     /// An unbuilt method, and a value the runtime cannot hold, die naming the selector

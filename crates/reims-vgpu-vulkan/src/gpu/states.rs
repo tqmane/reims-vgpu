@@ -157,7 +157,8 @@ use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Policy, decide, decide_describing, error_text, get_describing, plain, plain_at, unrepresentable,
+    Policy, RUNTIME_DOMAIN, decide, decide_describing, error_text, get_describing, plain, plain_at,
+    unrepresentable,
 };
 use crate::gpu::desc::{VulkanRenderPipelineDescriptor, VulkanTileRenderPipelineDescriptor};
 use crate::gpu::device::{VulkanDevice, nil_pipeline_descriptor};
@@ -418,6 +419,13 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
             RuntimeInput::DynamicSymbol { .. } | RuntimeInput::DynamicLibrary { .. },
         )) => UNDEFINED_SYMBOLS,
         rt::Error::MetalError(m) => m.code,
+        _ if !crate::answer::strict() => {
+            log::error!(
+                target: "reims_vgpu_vulkan::gpu::states",
+                "pipeline creation rejected by runtime (non-fatal): {e}"
+            );
+            METAL_REFUSES
+        }
         _ => return None,
     };
     Some(NsErrorText {
@@ -573,20 +581,21 @@ pub(crate) fn kernel_direct_arguments_decided(sel: &'static str, d: &ComputePipe
 /// The death at `sel` of a state that supports indirect command buffers whose functions' use of
 /// a direct texture or sampler argument the compile layer refused to decide, with `e`; `formats`
 /// are the descriptor's.
-fn undecided_direct_arguments(
-    sel: &'static str,
-    e: &metal2vulkan::error::Error,
-    formats: &str,
-) -> ! {
-    unrepresentable(
-        sel,
-        &format!(
-            "whether a state that supports indirect command buffers has a function that uses a \
-             direct texture or sampler argument, for which Metal answers nil and an NSError: the \
-             compile layer refused to decide it ({e}), and the runtime made the state without \
-             deciding; {formats}"
-        ),
-    )
+fn undecided_direct_arguments(sel: &'static str, e: &metal2vulkan::error::Error, formats: &str) {
+    let what = format!(
+        "whether a state that supports indirect command buffers has a function that uses a \
+         direct texture or sampler argument, for which Metal answers nil and an NSError: the \
+         compile layer refused to decide it ({e}), and the runtime made the state without \
+         deciding; {formats}"
+    );
+    if !crate::answer::strict() {
+        log::error!(
+            target: "reims_vgpu_vulkan::gpu::states",
+            "platform call {sel} skipped direct-argument check (non-fatal): {what}"
+        );
+        return;
+    }
+    unrepresentable(sel, &what);
 }
 
 /// `stage` with the dynamic libraries its imports reach loaded from the files their install
@@ -742,6 +751,25 @@ pub(crate) fn compute_formats(d: &ComputePipelineDescriptor) -> String {
     }
 }
 
+fn raw_format_or_die(sel: &'static str, raw: &serialized::RawFormat) -> Result<(), NsErrorText> {
+    if crate::answer::strict() {
+        raw.dies(sel);
+    }
+    let description = format!(
+        "a state whose {} is pixel format {} (unsupported)",
+        raw.attachment, raw.raw
+    );
+    log::error!(
+        target: "reims_vgpu_vulkan::gpu::states",
+        "platform call {sel} skipped with error (non-fatal): {description}"
+    );
+    Err(NsErrorText {
+        domain: RUNTIME_DOMAIN.to_owned(),
+        code: METAL_REFUSES,
+        description,
+    })
+}
+
 /// `newRenderPipelineStateWithDescriptor:options:reflection:error:` of a guest's descriptor, at
 /// its resource index ([`crate::gpu::desc::PipelineDescriptorObject::placement`]); no reflection
 /// is asked for, as core asks for none. A nil descriptor, an empty blob's, is Metal's `NSError`
@@ -760,8 +788,10 @@ pub(crate) fn new_render_pipeline_state_from_descriptor(
     let Some(descriptor) = descriptor else {
         return Ok(Err(nil_pipeline_descriptor()));
     };
-    if let Some(raw) = &descriptor.raw_format {
-        raw.dies(sel);
+    if let Some(raw) = &descriptor.raw_format
+        && let Err(err) = raw_format_or_die(sel, raw)
+    {
+        return Ok(Err(err));
     }
     let (d, placement) = plain(|| (descriptor.desc.lock().clone(), descriptor.placement()));
     let options = pipeline_options(options, placement, descriptor.label.clone());
@@ -771,9 +801,19 @@ pub(crate) fn new_render_pipeline_state_from_descriptor(
         || {
             let state = plain_at(sel, || device.raw.new_render_pipeline_state(&d, &options))
                 .map_err(|e| {
-                    let colors = d.color_attachments.map(|c| c.map(|c| c.pixel_format));
-                    let depth = (d.depth_format, d.stencil_format);
-                    serialized::RawFormat::refused(sel, &colors, depth, || render_formats(&d), e)
+                    if crate::answer::strict() {
+                        let colors = d.color_attachments.map(|c| c.map(|c| c.pixel_format));
+                        let depth = (d.depth_format, d.stencil_format);
+                        serialized::RawFormat::refused(
+                            sel,
+                            &colors,
+                            depth,
+                            || render_formats(&d),
+                            e,
+                        )
+                    } else {
+                        e
+                    }
                 });
             if descriptor.nearest_even
                 && let Ok(raw) = &state
@@ -813,8 +853,10 @@ pub(crate) fn new_tile_render_pipeline_state(
     let Some(descriptor) = descriptor else {
         return Ok(Err(nil_pipeline_descriptor()));
     };
-    if let Some(raw) = &descriptor.raw_format {
-        raw.dies(sel);
+    if let Some(raw) = &descriptor.raw_format
+        && let Err(err) = raw_format_or_die(sel, raw)
+    {
+        return Ok(Err(err));
     }
     let (d, placement) = plain(|| (descriptor.desc.lock().clone(), descriptor.placement()));
     let options = pipeline_options(options, placement, descriptor.label.clone());
@@ -832,14 +874,18 @@ pub(crate) fn new_tile_render_pipeline_state(
                     device.raw.new_tile_render_pipeline_state(&d, &options)
                 })
                 .map_err(|e| {
-                    let colors = d.color_attachment_formats;
-                    serialized::RawFormat::refused(
-                        sel,
-                        &colors,
-                        (None, None),
-                        || tile_formats(&d),
-                        e,
-                    )
+                    if crate::answer::strict() {
+                        let colors = d.color_attachment_formats;
+                        serialized::RawFormat::refused(
+                            sel,
+                            &colors,
+                            (None, None),
+                            || tile_formats(&d),
+                            e,
+                        )
+                    } else {
+                        e
+                    }
                 }),
             )
         },
@@ -1288,6 +1334,13 @@ mod tests {
         ));
         let answer = made(sel, descriptor(), Err(e)).unwrap().unwrap_err();
         assert_eq!(answer.code, 3);
+        let unknown_intrinsic =
+            rt::Error::Unsupported(metal2vulkan::error::Unsupported::not_implemented(
+                metal2vulkan::error::Feature::UnknownIntrinsic,
+            ));
+        assert!(pipeline_error(&unknown_intrinsic).is_none());
+        let relaxed_error = crate::answer::relaxed(|| pipeline_error(&unknown_intrinsic));
+        assert_eq!(relaxed_error.map(|err| err.code), Some(METAL_REFUSES));
     }
 
     /// A stage of the platform's own vertex function, from its metallib on the CPU: the lines of
@@ -1413,6 +1466,24 @@ mod tests {
             refusal_describing(&Error::DeviceLost, None),
             crate::answer::refusal(&Error::DeviceLost)
         );
+    }
+
+    #[test]
+    fn raw_format_returns_error_when_relaxed() {
+        let raw = serialized::RawFormat {
+            attachment: "colour attachment 0".to_owned(),
+            raw: 999,
+        };
+        let err = crate::answer::relaxed(|| {
+            raw_format_or_die(
+                "newRenderPipelineStateWithDescriptor:options:reflection:error:",
+                &raw,
+            )
+        })
+        .unwrap_err();
+        assert_eq!(err.code, METAL_REFUSES);
+        assert!(err.description.contains("colour attachment 0"));
+        assert!(err.description.contains("999"));
     }
 
     #[cfg(target_os = "macos")]

@@ -1035,6 +1035,13 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                         Err(rt::Error::Compile(metal2vulkan::error::Error::InvalidInput(_))) => {
                             Ok(Err(invalid_library_file()))
                         }
+                        Err(e) if !crate::answer::strict() => {
+                            log::error!(
+                                target: "reims_vgpu_vulkan::gpu::device",
+                                "platform call {sel} skipped with error (non-fatal): {e}"
+                            );
+                            Ok(Err(crate::answer::error_text(&e)))
+                        }
                         Err(e) => Err(e),
                     }
                 })
