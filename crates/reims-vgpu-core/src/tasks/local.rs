@@ -737,6 +737,18 @@ impl<P: Platform> ResourceHost<P> for LocalTask<P> {
         self.on_platform(|| self.buffer_for_page(hold, page, length))
     }
 
+    fn guest_pages_for_virtual_page(
+        &self,
+        hold: Hold<'_>,
+        page: u32,
+        length: u64,
+    ) -> RaiseResult<Option<crate::memory::map::GuestPages<P>>> {
+        if let Backend::Blocks { .. } = self.backend {
+            return Ok(None);
+        }
+        self.on_platform(|| self.guest_pages(hold, page_address(page), length))
+    }
+
     fn prepare_backing(
         &self,
         hold: Hold<'_>,

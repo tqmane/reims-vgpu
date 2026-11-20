@@ -82,6 +82,13 @@ pub trait HostVm: Send + Sync {
     fn protect_max(&self, addr: HostAddr, len: u64, prot: VmProt) -> Result<(), KernReturn>;
     /// `mach_vm_deallocate(task, addr, len)`. Every caller ignores the result.
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn;
+    /// Whether a memory map's mapping of one contiguous run of guest pages is the host's own
+    /// mapping of them, with no alias made (`MemoryMap::new_range_mapping`): where an alias costs
+    /// more than its pages are worth. Windows: a view mapped into QEMU's process while its WHPX
+    /// vCPUs run took about 10 ms, and core maps a guest texture's pages afresh for each buffer.
+    fn aliases_guest_in_place(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

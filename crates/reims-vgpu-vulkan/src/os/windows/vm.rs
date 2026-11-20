@@ -246,9 +246,61 @@ fn split(views: &mut BTreeMap<u64, View>, at: u64) -> Result<(), KernReturn> {
     Ok(())
 }
 
+/// Diagnostics of remaps (`remap_shared_overwrite`): their phases' times, summed over a second and
+/// written as a warning where they took 100 ms or more of it, so a FIFO thread that maps a guest
+/// texture page by page shows where its time went.
+mod remap_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    pub(super) static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PIECES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LOCK: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SPLIT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static UNMAP: AtomicU64 = AtomicU64::new(0);
+    pub(super) static INSTALL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SLOWEST: AtomicU64 = AtomicU64::new(0);
+    static WINDOW: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+    pub(super) fn add(counter: &AtomicU64, since: Instant) {
+        counter.fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+    }
+
+    /// Ends one remap that began at `started`, writing the second's sums once it is over.
+    pub(super) fn finish(started: Instant, pieces: usize, bytes: u64, views: usize) {
+        let took = started.elapsed().as_nanos() as u64;
+        CALLS.fetch_add(1, Relaxed);
+        PIECES.fetch_add(pieces as u64, Relaxed);
+        BYTES.fetch_add(bytes, Relaxed);
+        TOTAL.fetch_add(took, Relaxed);
+        SLOWEST.fetch_max(took, Relaxed);
+        let mut window = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let begun = *window.get_or_insert_with(Instant::now);
+        if begun.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        *window = Some(Instant::now());
+        let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
+        let (calls, pieces, bytes) = (CALLS.swap(0, Relaxed), PIECES.swap(0, Relaxed), BYTES.swap(0, Relaxed));
+        let (total, lock, split, unmap, install, slowest) =
+            (ms(&TOTAL), ms(&LOCK), ms(&SPLIT), ms(&UNMAP), ms(&INSTALL), ms(&SLOWEST));
+        if total >= 100.0 {
+            log::warn!(
+                "remaps over {:.2} s: {calls} calls, {pieces} pieces, {} KiB, {total:.1} ms (lock                  wait {lock:.1}, splits {split:.1}, unmaps {unmap:.1}, installs {install:.1};                  slowest call {slowest:.1}); {views} views",
+                begun.elapsed().as_secs_f64(),
+                bytes >> 10
+            );
+        }
+    }
+}
+
 fn replace(first: u64, length: u64, new: &[Piece]) -> Result<(), KernReturn> {
     let end = first.checked_add(length).ok_or(INVALID_ARGUMENT)?;
+    let phase = std::time::Instant::now();
     let mut views = VIEWS.lock();
+    remap_stats::add(&remap_stats::LOCK, phase);
     let mut at = first;
     while at < end {
         let Some((&base, view)) = views.range(..=at).next_back() else {
@@ -259,19 +311,26 @@ fn replace(first: u64, length: u64, new: &[Piece]) -> Result<(), KernReturn> {
         }
         at = (base + view.length).min(end);
     }
+    let phase = std::time::Instant::now();
     split(&mut views, first)?;
     split(&mut views, end)?;
+    remap_stats::add(&remap_stats::SPLIT, phase);
     let old: Vec<_> = views
         .range(first..end)
         .map(|(&at, v)| (at, v.clone()))
         .collect();
+    let phase = std::time::Instant::now();
     for (at, _) in &old {
         unmap(*at);
     }
     if old.len() > 1 {
         coalesce(first, length);
     }
-    if let Err(kr) = install(first, length, new) {
+    remap_stats::add(&remap_stats::UNMAP, phase);
+    let phase = std::time::Instant::now();
+    let installed = install(first, length, new);
+    remap_stats::add(&remap_stats::INSTALL, phase);
+    if let Err(kr) = installed {
         if install(first, length, &pieces(first, &old)).is_err() {
             cannot_restore("restore overwritten section views");
         }
@@ -381,8 +440,12 @@ impl WindowsVm {
     }
     /// Whether each byte is committed and readable, without dereferencing guest pointers.
     pub fn readable(&self, address: HostAddr, length: u64) -> bool {
-        if files::readable(address.addr().to_u64(), length) == Some(false) {
-            return false;
+        // The table's answer stands where it knows every byte: its views and the host's
+        // registered memory (QEMU's guest memory, one view of gigabytes, whose `VirtualQuery`
+        // walks the page tables of the whole view under the address space lock).
+        match files::readable(address.addr().to_u64(), length) {
+            Some(answer) => return answer,
+            None => {}
         }
         let Some(end) = address.addr().to_u64().checked_add(length) else {
             return false;
@@ -417,6 +480,9 @@ impl HostVm for WindowsVm {
     }
     fn page_shift(&self) -> u32 {
         page_size().trailing_zeros()
+    }
+    fn aliases_guest_in_place(&self) -> bool {
+        true
     }
     fn allocate_anywhere(&self, length: u64) -> Result<HostAddr, KernReturn> {
         let (_, length) = pages(HostAddr::NULL, length).ok_or(NO_SPACE)?;
@@ -463,9 +529,12 @@ impl HostVm for WindowsVm {
             length.checked_add(offset).ok_or(INVALID_ARGUMENT)?,
         )
         .ok_or(INVALID_ARGUMENT)?;
+        let started = std::time::Instant::now();
         let (source, _) = pages(source, 1).ok_or(INVALID_ADDRESS)?;
         let parts = files::pieces(source, length).ok_or(INVALID_ADDRESS)?;
         map_parts(first, length, &parts)?;
+        let views = VIEWS.lock().len();
+        remap_stats::finish(started, parts.len(), length, views);
         Ok(destination)
     }
     fn protect_max(&self, address: HostAddr, length: u64, prot: VmProt) -> Result<(), KernReturn> {
@@ -573,6 +642,520 @@ pub(crate) mod tests {
         }
         assert!(vm.deallocate(target, 3 * PAGE).is_success());
         assert!(!mapped(target));
+    }
+    /// How long core's mapping of a texture over scattered guest pages takes: a target the size
+    /// of a 2774x1708 BGRA8 surface, each page remapped from another page of a guest region, as
+    /// `MemoryMap::map_physical_range` remaps them one physical range at a time.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn times_a_texture_mapped_page_by_page() {
+        let vm = WindowsVm;
+        let guest_pages = 65536u64;
+        let guest = vm.allocate_anywhere(guest_pages * PAGE).unwrap();
+        let pages = (2774u64 * 1708 * 4).div_ceil(PAGE);
+        // Rounds 2 and 3 beside 8 threads that keep writing their own memory, as QEMU's vCPUs
+        // keep running in the process while a FIFO thread maps.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut busy = Vec::new();
+        for round in 0..4 {
+            if round == 2 {
+                for _ in 0..8 {
+                    let stop = Arc::clone(&stop);
+                    busy.push(std::thread::spawn(move || {
+                        let mut memory = vec![0u8; 64 << 20];
+                        let mut i = 0usize;
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            let at = i % memory.len();
+                            memory[at] = memory[at].wrapping_add(1);
+                            i = i.wrapping_add(4096 + 64);
+                        }
+                    }));
+                }
+            }
+            let target = vm.allocate_anywhere(pages * PAGE).unwrap();
+            let started = std::time::Instant::now();
+            for i in 0..pages {
+                let from = (i * 7919 + round * 13) % guest_pages;
+                let source = HostAddr::from_addr(guest.addr() + (from * PAGE).to_usize());
+                let to = HostAddr::from_addr(target.addr() + (i * PAGE).to_usize());
+                vm.remap_shared_overwrite(to, source, PAGE).unwrap();
+            }
+            let elapsed = started.elapsed();
+            println!(
+                "round {round}: {pages} pages in {:.1} ms, {:.1} us a page",
+                elapsed.as_secs_f64() * 1e3,
+                elapsed.as_secs_f64() * 1e6 / pages as f64
+            );
+            assert!(vm.deallocate(target, pages * PAGE).is_success());
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for thread in busy {
+            thread.join().unwrap();
+        }
+        assert!(vm.deallocate(guest, guest_pages * PAGE).is_success());
+    }
+    /// How a remap's time grows with the views the process already holds: QEMU's had 246000
+    /// single-page views of guest memory when each remap took about 10 ms.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn times_remaps_beside_many_views() {
+        let vm = WindowsVm;
+        let guest_pages: u64 = std::env::var("REIMS_TEST_GUEST_PAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(65536);
+        let guest = vm.allocate_anywhere(guest_pages * PAGE).unwrap();
+        // Resident, as QEMU's guest memory is.
+        for page in 0..guest_pages.min(262_144) {
+            // SAFETY: a live writable allocation.
+            unsafe { guest.as_ptr::<u8>().add((page * PAGE).to_usize()).write(1) };
+        }
+        // And mapped into a WHPX partition as guest physical memory, as QEMU's is.
+        #[link(name = "WinHvPlatform")]
+        unsafe extern "system" {
+            fn WHvCreatePartition(partition: *mut *mut core::ffi::c_void) -> i32;
+            fn WHvSetPartitionProperty(
+                partition: *mut core::ffi::c_void,
+                code: u32,
+                buffer: *const core::ffi::c_void,
+                size: u32,
+            ) -> i32;
+            fn WHvSetupPartition(partition: *mut core::ffi::c_void) -> i32;
+            fn WHvMapGpaRange(
+                partition: *mut core::ffi::c_void,
+                source: *mut core::ffi::c_void,
+                guest_address: u64,
+                size: u64,
+                flags: u32,
+            ) -> i32;
+            fn WHvDeletePartition(partition: *mut core::ffi::c_void) -> i32;
+        }
+        let whpx = std::env::var_os("REIMS_TEST_WHPX").is_some();
+        let mut partition = std::ptr::null_mut();
+        if whpx {
+            // SAFETY: WHPX calls on a partition this test owns; the guest range stays mapped
+            // in this process until the partition is deleted below.
+            unsafe {
+                assert_eq!(WHvCreatePartition(&mut partition), 0);
+                let processors: u32 = 1;
+                // WHvPartitionPropertyCodeProcessorCount
+                assert_eq!(WHvSetPartitionProperty(partition, 0x1fff, (&raw const processors).cast(), 4), 0);
+                assert_eq!(WHvSetupPartition(partition), 0);
+                // Read | Write | Execute
+                assert_eq!(WHvMapGpaRange(partition, guest.as_ptr(), 0, guest_pages * PAGE, 7), 0);
+            }
+            println!("guest memory mapped into a WHPX partition");
+        }
+        let held_pages = 200_000u64;
+        let held = vm.allocate_anywhere(held_pages * PAGE).unwrap();
+        let mut made = 0u64;
+        for goal in [0u64, 10_000, 50_000, 100_000, 200_000] {
+            while made < goal {
+                let from = (made * 7919) % guest_pages;
+                let source = HostAddr::from_addr(guest.addr() + (from * PAGE).to_usize());
+                let to = HostAddr::from_addr(held.addr() + (made * PAGE).to_usize());
+                vm.remap_shared_overwrite(to, source, PAGE).unwrap();
+                made += 1;
+            }
+            let target = vm.allocate_anywhere(256 * PAGE).unwrap();
+            let started = std::time::Instant::now();
+            for i in 0..256u64 {
+                let from = (i * 104_729) % guest_pages;
+                let source = HostAddr::from_addr(guest.addr() + (from * PAGE).to_usize());
+                let to = HostAddr::from_addr(target.addr() + (i * PAGE).to_usize());
+                vm.remap_shared_overwrite(to, source, PAGE).unwrap();
+            }
+            println!(
+                "{} views: {:.1} us a remap",
+                VIEWS.lock().len(),
+                started.elapsed().as_secs_f64() * 1e6 / 256.0
+            );
+            assert!(vm.deallocate(target, 256 * PAGE).is_success());
+        }
+        assert!(vm.deallocate(held, held_pages * PAGE).is_success());
+        if whpx {
+            // SAFETY: the partition made above.
+            unsafe { WHvDeletePartition(partition) };
+        }
+        assert!(vm.deallocate(guest, guest_pages * PAGE).is_success());
+    }
+    /// A remap's time while WHPX vCPUs run in the process, as QEMU's do: `REIMS_TEST_VCPUS`
+    /// processors spin in real mode on `jmp $` (0xEB 0xFE at the reset vector) while the remaps
+    /// map pages of a guest region the partition maps as guest memory.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn times_remaps_beside_running_vcpus() {
+        type Partition = *mut core::ffi::c_void;
+        #[link(name = "WinHvPlatform")]
+        unsafe extern "system" {
+            fn WHvCreatePartition(partition: *mut Partition) -> i32;
+            fn WHvSetPartitionProperty(p: Partition, code: u32, b: *const core::ffi::c_void, s: u32) -> i32;
+            fn WHvSetupPartition(p: Partition) -> i32;
+            fn WHvMapGpaRange(p: Partition, src: *mut core::ffi::c_void, gpa: u64, size: u64, flags: u32) -> i32;
+            fn WHvCreateVirtualProcessor(p: Partition, index: u32, flags: u32) -> i32;
+            fn WHvRunVirtualProcessor(p: Partition, index: u32, exit: *mut core::ffi::c_void, size: u32) -> i32;
+            fn WHvCancelRunVirtualProcessor(p: Partition, index: u32, flags: u32) -> i32;
+            fn WHvDeleteVirtualProcessor(p: Partition, index: u32) -> i32;
+            fn WHvDeletePartition(p: Partition) -> i32;
+        }
+        struct Shared(Partition);
+        // SAFETY: WHPX partition handles are used from any thread.
+        unsafe impl Send for Shared {}
+        unsafe impl Sync for Shared {}
+        let vcpus: u32 = std::env::var("REIMS_TEST_VCPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let vm = WindowsVm;
+        let guest_pages = 65536u64;
+        let guest = vm.allocate_anywhere(guest_pages * PAGE).unwrap();
+        for page in 0..guest_pages {
+            // SAFETY: a live writable allocation.
+            unsafe { guest.as_ptr::<u8>().add((page * PAGE).to_usize()).write(1) };
+        }
+        let reset = vm.allocate_anywhere(16 * PAGE).unwrap();
+        // The reset vector jumps to F000:0000, whose loop writes a byte of every 4 KiB page of
+        // guest memory 0..0xA0000, again and again, as a guest keeps its pages in use.
+        const WRITER: [u8; 24] = [
+            0x31, 0xc0, 0x8e, 0xd8, 0x31, 0xdb, 0xfe, 0x07, 0x81, 0xc3, 0x00, 0x10, 0x75, 0xf8,
+            0x05, 0x00, 0x10, 0x3d, 0x00, 0xa0, 0x72, 0xec, 0xeb, 0xe8,
+        ];
+        // SAFETY: live writable allocations: the guest's 0xf0000 and the reset vector page.
+        unsafe {
+            for (i, byte) in WRITER.iter().enumerate() {
+                guest.as_ptr::<u8>().add(0xf0000 + i).write(*byte);
+            }
+            for (i, byte) in [0xea, 0x00, 0x00, 0x00, 0xf0].iter().enumerate() {
+                reset.as_ptr::<u8>().add(0xfff0 + i).write(*byte);
+                // WHPX starts a processor at CS base 0, RIP 0xfff0.
+                guest.as_ptr::<u8>().add(0xfff0 + i).write(*byte);
+            }
+        }
+        let mut partition: Partition = std::ptr::null_mut();
+        // SAFETY: WHPX calls on a partition this test owns.
+        unsafe {
+            assert_eq!(WHvCreatePartition(&mut partition), 0);
+            assert_eq!(WHvSetPartitionProperty(partition, 0x1fff, (&raw const vcpus).cast(), 4), 0);
+            assert_eq!(WHvSetupPartition(partition), 0);
+            assert_eq!(WHvMapGpaRange(partition, guest.as_ptr(), 0, guest_pages * PAGE, 7), 0);
+            assert_eq!(WHvMapGpaRange(partition, reset.as_ptr(), 0xffff_0000, 16 * PAGE, 7), 0);
+            for i in 0..vcpus {
+                assert_eq!(WHvCreateVirtualProcessor(partition, i, 0), 0);
+            }
+        }
+        let shared = Arc::new(Shared(partition));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let measure = |label: &str| {
+            let target = vm.allocate_anywhere(256 * PAGE).unwrap();
+            let started = std::time::Instant::now();
+            let mut done = 0u64;
+            for i in 0..256u64 {
+                if started.elapsed() > std::time::Duration::from_secs(5) {
+                    break;
+                }
+                done += 1;
+                // A page the vCPUs keep writing.
+                let from = (i * 7) % 0xa0;
+                let source = HostAddr::from_addr(guest.addr() + (from * PAGE).to_usize());
+                let to = HostAddr::from_addr(target.addr() + (i * PAGE).to_usize());
+                vm.remap_shared_overwrite(to, source, PAGE).unwrap();
+            }
+            let mapped = started.elapsed();
+            let started = std::time::Instant::now();
+            assert!(vm.deallocate(target, 256 * PAGE).is_success());
+            println!(
+                "{label}: {done} remaps, {:.1} us a remap; unmapping {:.1} ms",
+                mapped.as_secs_f64() * 1e6 / done.max(1) as f64,
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        };
+        measure("no vCPU running");
+        let mut runners = Vec::new();
+        for i in 0..vcpus {
+            let (shared, stop) = (Arc::clone(&shared), Arc::clone(&stop));
+            runners.push(std::thread::spawn(move || {
+                let mut exit = vec![0u8; 4096];
+                let mut first = true;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: the partition lives until every runner joined.
+                    let hr = unsafe { WHvRunVirtualProcessor(shared.0, i, exit.as_mut_ptr().cast(), 4096) };
+                    if first && i == 0 {
+                        first = false;
+                        let reason = u32::from_le_bytes(exit[0..4].try_into().unwrap());
+                        println!("vCPU 0 first exit: hr {hr:#x}, reason {reason:#x}, rip bytes {:x?}", &exit[0..48]);
+                    }
+                }
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        measure(&format!("{vcpus} vCPUs running"));
+        measure(&format!("{vcpus} vCPUs running, again"));
+        // Beside a thread that keeps emptying the process's working set, as Windows trims a
+        // process under memory pressure: the vCPUs' next writes fault their pages back in.
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn SetProcessWorkingSetSize(process: *mut core::ffi::c_void, min: usize, max: usize) -> i32;
+            }
+            let trimming = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let trimmer = {
+                let trimming = Arc::clone(&trimming);
+                std::thread::spawn(move || {
+                    let mut trims = 0u64;
+                    while !trimming.load(std::sync::atomic::Ordering::Relaxed) {
+                        // SAFETY: this process's own working set; usize::MAX twice empties it.
+                        unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+                        trims += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    trims
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            measure("vCPUs running, working set trimmed");
+            measure("vCPUs running, working set trimmed, again");
+            trimming.store(true, std::sync::atomic::Ordering::Relaxed);
+            println!("trims: {}", trimmer.join().unwrap());
+        }
+        // Beside a thread that keeps locking and unlocking 64 MiB of the guest's pages, as a
+        // driver's import of host memory probes and locks them.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn VirtualLock(address: *mut core::ffi::c_void, size: usize) -> i32;
+            fn VirtualUnlock(address: *mut core::ffi::c_void, size: usize) -> i32;
+            fn SetProcessWorkingSetSize(process: *mut core::ffi::c_void, min: usize, max: usize) -> i32;
+        }
+        // SAFETY: this process's own working set.
+        unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), 512 << 20, 1024 << 20) };
+        let locking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let locker = {
+            let locking = Arc::clone(&locking);
+            let at = guest.addr() + (16 << 20);
+            let lock_bytes: usize = std::env::var("REIMS_TEST_LOCK_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(8) << 20;
+            std::thread::spawn(move || {
+                let mut locks = 0u64;
+                while !locking.load(std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: a live range of the guest allocation.
+                    unsafe {
+                        if VirtualLock(std::ptr::with_exposed_provenance_mut(at), lock_bytes) != 0 {
+                            locks += 1;
+                        }
+                        VirtualUnlock(std::ptr::with_exposed_provenance_mut(at), lock_bytes);
+                    }
+                }
+                locks
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        measure("vCPUs and a locker running");
+        locking.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("locks taken: {}", locker.join().unwrap());
+        // SAFETY: a live allocation the vCPUs write.
+        let counts = unsafe { [guest.as_ptr::<u8>().add(0x1_0000).read(), guest.as_ptr::<u8>().add(0x9_f000).read()] };
+        println!("bytes the vCPUs count at 0x10000 and 0x9f000: {counts:?}");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..vcpus {
+            // SAFETY: the partition's processors made above.
+            unsafe { WHvCancelRunVirtualProcessor(partition, i, 0) };
+        }
+        for runner in runners {
+            runner.join().unwrap();
+        }
+        // SAFETY: the partition and processors made above, none running.
+        unsafe {
+            for i in 0..vcpus {
+                WHvDeleteVirtualProcessor(partition, i);
+            }
+            WHvDeletePartition(partition);
+        }
+        assert!(vm.deallocate(guest, guest_pages * PAGE).is_success());
+    }
+    /// A remap's time beside a thread that keeps importing the guest's pages into Vulkan buffers
+    /// and freeing them, as the library's no-copy buffers over guest pages do: the driver locks
+    /// a host range's pages when it imports them.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn times_remaps_beside_imports() {
+        use metal2vulkan_runtime as rt;
+        let vm = WindowsVm;
+        let guest_pages = 65536u64;
+        let guest = vm.allocate_anywhere(guest_pages * PAGE).unwrap();
+        for page in 0..guest_pages {
+            // SAFETY: a live writable allocation.
+            unsafe { guest.as_ptr::<u8>().add((page * PAGE).to_usize()).write(1) };
+        }
+        let device = rt::Device::system_default().unwrap();
+        let measure = |label: &str| {
+            let target = vm.allocate_anywhere(256 * PAGE).unwrap();
+            let started = std::time::Instant::now();
+            let mut done = 0u64;
+            for i in 0..256u64 {
+                if started.elapsed() > std::time::Duration::from_secs(5) {
+                    break;
+                }
+                done += 1;
+                let from = (i * 104_729) % guest_pages;
+                let source = HostAddr::from_addr(guest.addr() + (from * PAGE).to_usize());
+                let to = HostAddr::from_addr(target.addr() + (i * PAGE).to_usize());
+                vm.remap_shared_overwrite(to, source, PAGE).unwrap();
+            }
+            let mapped = started.elapsed();
+            assert!(vm.deallocate(target, 256 * PAGE).is_success());
+            println!("{label}: {done} remaps, {:.1} us a remap", mapped.as_secs_f64() * 1e6 / done.max(1) as f64);
+        };
+        measure("no imports");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mib: u64 = std::env::var("REIMS_TEST_IMPORT_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let importer = {
+            let (stop, device) = (Arc::clone(&stop), device.clone());
+            let base = guest.addr();
+            std::thread::spawn(move || {
+                let mut imports = 0u64;
+                let mut at = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let offset = (at * (mib << 20)) % ((guest_pages * PAGE) - (mib << 20));
+                    at += 1;
+                    let bytes = std::ptr::NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(base + offset.to_usize())).unwrap();
+                    // SAFETY: a live writable range of the guest allocation, kept mapped until
+                    // the buffer drops below.
+                    let buffer = unsafe {
+                        device.new_buffer_with_bytes_no_copy(bytes, mib << 20, rt::ResourceOptions::shared(), None)
+                    };
+                    if buffer.is_ok() {
+                        imports += 1;
+                    }
+                    drop(buffer);
+                }
+                imports
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        measure(&format!("beside {mib} MiB imports"));
+        measure(&format!("beside {mib} MiB imports, again"));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("imports made: {}", importer.join().unwrap());
+        assert!(vm.deallocate(guest, guest_pages * PAGE).is_success());
+    }
+    /// A remap's time beside a thread that keeps reading a file into the guest's pages, as
+    /// QEMU's block layer reads a disk image into guest memory: `REIMS_TEST_READ_FILE` names the
+    /// file, `REIMS_TEST_UNBUFFERED` reads past the cache (`FILE_FLAG_NO_BUFFERING`).
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn times_remaps_beside_file_reads() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn ReadFile(file: *mut core::ffi::c_void, buffer: *mut core::ffi::c_void, length: u32, read: *mut u32, overlapped: *mut core::ffi::c_void) -> i32;
+            fn SetFilePointerEx(file: *mut core::ffi::c_void, distance: i64, new: *mut i64, method: u32) -> i32;
+        }
+        let path = std::env::var("REIMS_TEST_READ_FILE").expect("REIMS_TEST_READ_FILE");
+        let unbuffered = std::env::var_os("REIMS_TEST_UNBUFFERED").is_some();
+        let vm = WindowsVm;
+        let guest_pages = 65536u64;
+        let guest = vm.allocate_anywhere(guest_pages * PAGE).unwrap();
+        for page in 0..guest_pages {
+            // SAFETY: a live writable allocation.
+            unsafe { guest.as_ptr::<u8>().add((page * PAGE).to_usize()).write(1) };
+        }
+        let measure = |label: &str| {
+            let target = vm.allocate_anywhere(256 * PAGE).unwrap();
+            let started = std::time::Instant::now();
+            let mut done = 0u64;
+            for i in 0..256u64 {
+                if started.elapsed() > std::time::Duration::from_secs(5) {
+                    break;
+                }
+                done += 1;
+                let from = (i * 104_729) % guest_pages;
+                let source = HostAddr::from_addr(guest.addr() + (from * PAGE).to_usize());
+                let to = HostAddr::from_addr(target.addr() + (i * PAGE).to_usize());
+                vm.remap_shared_overwrite(to, source, PAGE).unwrap();
+            }
+            let mapped = started.elapsed();
+            assert!(vm.deallocate(target, 256 * PAGE).is_success());
+            println!("{label}: {done} remaps, {:.1} us a remap", mapped.as_secs_f64() * 1e6 / done.max(1) as f64);
+        };
+        measure("no reads");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let stop = Arc::clone(&stop);
+            let base = guest.addr();
+            std::thread::spawn(move || {
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                if unbuffered {
+                    options.custom_flags(0x2000_0000); // FILE_FLAG_NO_BUFFERING
+                }
+                let file = options.open(&path).unwrap();
+                let (mut reads, mut at) = (0u64, 0usize);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut read = 0u32;
+                    let into = base + ((at * 65536) % (200 << 20));
+                    at += 1;
+                    // SAFETY: a live writable 64 KiB of the guest allocation, page aligned.
+                    let ok = unsafe { ReadFile(file.as_raw_handle(), std::ptr::with_exposed_provenance_mut(into), 65536, &mut read, std::ptr::null_mut()) };
+                    if ok == 0 || read < 65536 {
+                        // SAFETY: the file opened above.
+                        unsafe { SetFilePointerEx(file.as_raw_handle(), 0, std::ptr::null_mut(), 0) };
+                    }
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        measure(if unbuffered { "beside unbuffered reads" } else { "beside cached reads" });
+        measure("again");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("reads: {}", reader.join().unwrap());
+        assert!(vm.deallocate(guest, guest_pages * PAGE).is_success());
+    }
+    /// How long `VirtualQuery` takes in one large committed, resident view, as QEMU's guest
+    /// memory is: the runtime's writability check before each import queries it.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn times_virtual_query_in_a_large_view() {
+        #[repr(C)]
+        struct Mbi { base: usize, allocation_base: usize, allocation_protect: u32, partition: u16, region_size: usize, state: u32, protect: u32, kind: u32 }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn VirtualQuery(at: *const core::ffi::c_void, info: *mut Mbi, length: usize) -> usize;
+        }
+        let vm = WindowsVm;
+        for gib in [1u64, 4] {
+            let pages = gib << 18;
+            let guest = vm.allocate_anywhere(pages * PAGE).unwrap();
+            for page in 0..pages {
+                // SAFETY: a live writable allocation.
+                unsafe { guest.as_ptr::<u8>().add((page * PAGE).to_usize()).write(1) };
+            }
+            for at in [0u64, pages / 2, pages - 2] {
+                let started = std::time::Instant::now();
+                let mut info = std::mem::MaybeUninit::<Mbi>::zeroed();
+                // SAFETY: a query of a live allocation into a sized output.
+                unsafe { VirtualQuery(std::ptr::with_exposed_provenance(guest.addr() + (at * PAGE).to_usize()), info.as_mut_ptr(), std::mem::size_of::<Mbi>()) };
+                // SAFETY: filled above.
+                let size = unsafe { info.assume_init().region_size };
+                println!("{gib} GiB view, query at page {at}: {:.1} us, region {} MiB", started.elapsed().as_secs_f64() * 1e6, size >> 20);
+                #[repr(C)]
+                struct Region { allocation_base: usize, allocation_protect: u32, region_type: u32, region_size: usize, commit_size: usize, partition: usize, node: usize }
+                #[link(name = "ntdll")]
+                unsafe extern "system" {
+                    fn NtQueryVirtualMemory(process: *mut core::ffi::c_void, at: *const core::ffi::c_void, class: u32, info: *mut Region, length: usize, returned: *mut usize) -> i32;
+                }
+                let started = std::time::Instant::now();
+                let mut region = std::mem::MaybeUninit::<Region>::zeroed();
+                // SAFETY: a query of a live allocation into a sized output.
+                let mut status = 0;
+                for (class, length) in [(2u32, 48usize), (2, 40), (2, 32), (7, 48), (7, 40)] {
+                    // SAFETY: as above.
+                    status = unsafe { NtQueryVirtualMemory(std::ptr::with_exposed_provenance_mut(usize::MAX), std::ptr::with_exposed_provenance(guest.addr() + (at * PAGE).to_usize()), class, region.as_mut_ptr(), length, std::ptr::null_mut()) };
+                    if status == 0 {
+                        println!("   class {class} length {length} works");
+                        break;
+                    }
+                }
+                // SAFETY: filled above where the status is success.
+                let region = unsafe { region.assume_init() };
+                println!("   region information: status {status:#x}, {:.1} us, protect {:#x}, type {:#x}, size {} MiB, commit {} MiB", started.elapsed().as_secs_f64() * 1e6, region.allocation_protect, region.region_type, region.region_size >> 20, region.commit_size >> 20);
+            }
+            assert!(vm.deallocate(guest, pages * PAGE).is_success());
+        }
     }
     #[test]
     fn failed_remap_preserves_bytes_and_overwrite_only_zeros_its_page() {

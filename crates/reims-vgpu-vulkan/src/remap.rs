@@ -351,6 +351,10 @@ impl HostVm for VulkanVm {
         self.vm.page_shift()
     }
 
+    fn aliases_guest_in_place(&self) -> bool {
+        self.vm.aliases_guest_in_place()
+    }
+
     fn allocate_anywhere(&self, len: u64) -> Result<HostAddr, KernReturn> {
         let at = self.vm.allocate_anywhere(len)?;
         self.changed(at, len);
