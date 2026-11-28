@@ -159,10 +159,12 @@
 //!     `setVertexAmplificationCount:viewMappings:`'s, or 1), or one not measured, draws and
 //!     executions die until the next `setVertexAmplificationCount:viewMappings:`.
 //! - **`useHeaps:count:` and `useResources:count:usage:`** reach the vertex and fragment stages,
-//!   as they do on Metal's render encoder. A nil entry of `useResources:count:usage:` is skipped,
-//!   as Metal goes on past one (`interplay_decodewalk_6`: an entry naming the render pipeline is
-//!   nil, and the walk runs on); one of the stages form, or a nil heap, which nothing measured,
-//!   dies.
+//!   as they do on Metal's render encoder. A nil entry of `useResources:count:usage:` or of
+//!   `useResources:count:usage:stages:` is skipped, as Metal goes on past one
+//!   (`interplay_decodewalk_6`: an entry naming the render pipeline is nil, and the walk runs on;
+//!   `interplay_lifetime_emptied_resource_render`: a ref past the object list is nil to the
+//!   stages form, and the triangle after it draws as without it). A nil heap, which nothing
+//!   measured, dies.
 //! - **Executing an indirect command buffer** runs its draws, with the encoder's render state, as
 //!   their records stand when the command buffer is committed, or, for a buffer the GPU may have
 //!   written (a blit wrote it, or an encoder made it resident for writing), once the work before
@@ -2080,19 +2082,6 @@ fn samplers<'a>(
     list.iter().map(|s| s.map(|s| &**s)).collect()
 }
 
-/// The runtime's form of core's resources, for `sel`: a nil one dies.
-fn resources<'a>(
-    sel: &'static str,
-    list: &'a [Option<ResourceRef<'a, VulkanPlatform>>],
-) -> Vec<rt::ResourceRef<'a>> {
-    list.iter()
-        .map(|r| {
-            r.as_ref()
-                .map_or_else(|| unrepresentable(sel, "a nil resource"), resource)
-        })
-        .collect()
-}
-
 /// The runtime's form of core's resources, the nil ones skipped.
 fn present<'a>(list: &'a [Option<ResourceRef<'a, VulkanPlatform>>]) -> Vec<rt::ResourceRef<'a>> {
     list.iter().flatten().map(resource).collect()
@@ -3781,7 +3770,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 usage,
                 stages,
             } => {
-                let some = resources(sel, list);
+                let some = present(list);
                 let usage: ResourceUsage = metal_value(sel, "resource usage", usage);
                 let stages: RenderStages = metal_value(sel, "render stages", stages);
                 let icbs = crate::gpu::icb::made_resident(list);
@@ -7120,8 +7109,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// A nil entry of useResources:count:usage: is skipped and the pass runs, as on Metal; one of
-    /// useResources:count:usage:stages:, which nothing measured, dies at its selector
+    /// A nil entry of useResources:count:usage: or of useResources:count:usage:stages: is skipped
+    /// and the pass runs, as on Metal
     #[test]
     fn a_nil_resource_is_skipped_where_metal_goes_on() {
         let d = dev();
@@ -7143,18 +7132,24 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        let site = catch_death(|| {
-            e.encode(
-                OnFault::Die,
-                RenderCmd::UseResourcesStages {
-                    resources: &[None, Some(ResourceRef::Buffer(&b))],
-                    usage: 1,
-                    stages: 1,
-                },
-            )
-        })
-        .unwrap_err();
-        assert_eq!(site.file, "useResources:count:usage:stages:");
+        e.encode(
+            OnFault::Die,
+            RenderCmd::UseResourcesStages {
+                resources: &[None, Some(ResourceRef::Buffer(&b))],
+                usage: 1,
+                stages: 1,
+            },
+        )
+        .unwrap();
+        e.encode(
+            OnFault::Die,
+            RenderCmd::UseResourcesStages {
+                resources: &[None],
+                usage: 1,
+                stages: 1,
+            },
+        )
+        .unwrap();
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
 

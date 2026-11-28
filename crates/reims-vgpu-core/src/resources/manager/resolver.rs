@@ -4,17 +4,26 @@
 //!
 //! The resolver's context object is the metal crate's, one per pipeline-descriptor send,
 //! holding [`function_with_function_ref`] as its resolver.
+//!
+//! A failed lookup is nil to Metal, as Apple's framework answers it, except a function whose
+//! entry is empty (type 0), which raises the function lookup's failure: Metal aborts on a nil
+//! vertex or compute function, and the raise faults the exec instead, as every other failed
+//! lookup of the decode does (`interplay_lifetime_held_pipeline_function_retyped`). A guest
+//! empties a task's entries when the process that owns it ends, without waiting for the execs
+//! that process queued, so an exec the host runs late makes its pipelines from empty entries
+//! (x86-64 macOS 26 guests' icon services, docs/qemu.md).
 
 use crate::num::Truncate;
 use crate::platform::Platform;
-use crate::raise::RaiseResult;
-use crate::resources::manager::ResourceManager;
+use crate::raise::{Raise, RaiseResult};
 use crate::resources::manager::states::Functions;
+use crate::resources::manager::{ObjectKind, RaiseKind, ResourceManager};
 use crate::rt::Hold;
 
 /// The function `function_ref` names: its low 32 bits are the reference. A lookup error is
-/// logged and nil to Metal; a raise from the lookup (a task cursor or a creator raising) is
-/// `Err`, which the platform carries through Metal's frames to the caller's handler.
+/// logged and nil to Metal, unless the reference's entry is empty, which raises the function
+/// lookup's failure; a raise from the lookup (a task cursor or a creator raising) is `Err` too.
+/// The platform carries an `Err` through Metal's frames to the caller's handler.
 pub fn function_with_function_ref<P: Platform>(
     hold: Hold<'_>,
     manager: &ResourceManager<P>,
@@ -25,6 +34,14 @@ pub fn function_with_function_ref<P: Platform>(
         // Nil for reference 0, with no log
         Ok(function) => function,
         Err(error) => {
+            let emptied = manager
+                .get_object_entry(reference)
+                .is_ok_and(|entry| entry.object_type() == 0);
+            if emptied {
+                log::warn!("pipeline function {reference} not found: {error}");
+                let kind = ObjectKind::Function;
+                return Err(Raise::new(RaiseKind::Lookup(kind)).with_detail(kind.failure()));
+            }
             log::warn!("pipeline function {reference} not found, given to Metal as nil: {error}");
             None
         }
@@ -87,6 +104,30 @@ mod tests {
         assert_eq!(
             fx.log().calls_to("cursor_from_virtual_offset")[0].args,
             vec![Arg::U64(REC), Arg::U64(0x10)]
+        );
+    }
+
+    /// An entry the guest emptied (type 0 and offset all ones, as a task's end leaves each of
+    /// its entries) raises the function lookup's failure, so the exec faults where Metal would
+    /// abort on the nil.
+    #[test]
+    fn an_empty_entry_raises() {
+        use crate::raise::RaiseId;
+        use crate::resources::manager::{ObjectKind, RaiseKind};
+        let fx = Fx::new(
+            &[(0, 0, 0), (6, 0x10, REC), (0, 0, u64::MAX)],
+            Placement::Off,
+        );
+        let (r, lines) = fx.logged(|| function_with_function_ref(Hold::NONE, &fx.m, 2));
+        let r = r.err().unwrap();
+        assert_eq!(
+            r.id(),
+            RaiseId::Manager(RaiseKind::Lookup(ObjectKind::Function))
+        );
+        assert_eq!(r.detail(), Some("function lookup failed"));
+        assert_eq!(
+            lines,
+            vec!["pipeline function 2 not found: object 2 has an empty entry"]
         );
     }
 

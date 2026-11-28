@@ -39,7 +39,8 @@
 //! - **The address and pipeline registries** keep the newest registration and are never
 //!   unregistered (`cache::tests::registries`).
 //! - **A lookup failure** logs and raises [`RaiseKind::Lookup`], except the untyped resource
-//!   lookup, which answers nil (`lookup::tests`).
+//!   lookup, which answers nil; its raising variant raises for an empty entry
+//!   (`lookup::tests`).
 
 pub mod cache;
 pub mod create;
@@ -98,6 +99,8 @@ pub enum ObjectKind {
     RateMap,
     /// An indirect command buffer.
     Icb,
+    /// Whichever resource a reference names (the untyped lookup's raising variant).
+    Resource,
 }
 
 impl ObjectKind {
@@ -115,6 +118,7 @@ impl ObjectKind {
             ObjectKind::Heap => "heap",
             ObjectKind::RateMap => "rasterization rate map",
             ObjectKind::Icb => "indirect command buffer",
+            ObjectKind::Resource => "resource",
         }
     }
 
@@ -132,6 +136,7 @@ impl ObjectKind {
             ObjectKind::Heap => "heap lookup failed",
             ObjectKind::RateMap => "rasterization rate map lookup failed",
             ObjectKind::Icb => "indirect command buffer lookup failed",
+            ObjectKind::Resource => "resource lookup failed",
         }
     }
 }
@@ -159,6 +164,7 @@ impl RaiseKind {
                 ObjectKind::Heap => "manager.lookup.heap",
                 ObjectKind::RateMap => "manager.lookup.rate_map",
                 ObjectKind::Icb => "manager.lookup.icb",
+                ObjectKind::Resource => "manager.lookup.resource",
             },
         }
     }

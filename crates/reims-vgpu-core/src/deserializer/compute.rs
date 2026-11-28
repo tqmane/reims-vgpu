@@ -19,7 +19,11 @@
 //! - **Dispatches** need a pipeline set in this pass; an indirect dispatch sends a nil buffer to
 //!   Metal as it is (`tests::dispatch_indirect::a_nil_buffer_is_passed_to_metal`).
 //! - **The resource and heap lists** (0x86, 0x87, 0xd6) refuse a count past the record's bytes
-//!   before reading any, and run under their own handler frame.
+//!   before reading any, and run under their own handler frame. UseResources (0x87) in a
+//!   concurrent encoder (0xdb 1) raises for a reference whose entry is empty, where Metal would
+//!   end the process at the nil (`ManagerLookup::get_resource_raising_empty`); every other
+//!   failed lookup of the untyped lists is nil
+//!   (`tests::decode::a_concurrent_pass_looks_resources_up_raising_empty`).
 //! - **A jump end** (`encodeEndDoWhile`, `encodeEndWhile`, `encodeEndIf`) that answers NO only
 //!   logs (`tests::jumps::an_end_returning_no_only_logs`).
 //! - **The end of a segment** not continued by the next ends the encoder, which stays held, and
@@ -195,6 +199,9 @@ pub struct ComputeDecoder<P: Platform> {
     command_buffer: Option<P::CommandBuffer>,
     /// The pipeline set in this pass: dropped at the pass's end and by a fault.
     pipeline: Option<P::ComputePipeline>,
+    /// Whether the encoder's pass asked for concurrent dispatch (0xdb 1), set with each new
+    /// segment's encoder.
+    concurrent: bool,
 }
 
 impl<P: Platform> ComputeDecoder<P> {
@@ -208,6 +215,7 @@ impl<P: Platform> ComputeDecoder<P> {
             encoder: None,
             command_buffer,
             pipeline: None,
+            concurrent: false,
         }
     }
 
@@ -270,6 +278,7 @@ impl<P: Platform> ComputeDecoder<P> {
     ) -> RaiseResult<()> {
         if header.continues_previous == 0 {
             let descriptor = self.decode_compute_pass_descriptor(segment)?;
+            self.concurrent = descriptor.dispatch_type == Some(1);
             let encoder = match &self.command_buffer {
                 Some(buffer) => buffer.compute_encoder_for_pass(&descriptor)?,
                 None => None,
@@ -635,8 +644,13 @@ impl<P: Platform> ComputeDecoder<P> {
             let command: CmdUseResources = cursor.read_or_raise(OnFault::Return)?;
             check_list(cursor, command.count)?;
             let deserializer = this.deserializer();
+            let lookup = deserializer.object_delegate();
             let resources = read_references(cursor, command.count, |r| {
-                deserializer.object_delegate().get_resource(hold, r)
+                if this.concurrent {
+                    lookup.get_resource_raising_empty(hold, r)
+                } else {
+                    lookup.get_resource(hold, r)
+                }
             })?;
             let refs: Vec<Option<ResourceRef<'_, P>>> =
                 resources.iter().map(resource_ref).collect();
@@ -2416,6 +2430,43 @@ mod tests {
                 }
                 .as_bytes(),
             )
+        }
+
+        /// A segment whose first record is 0xdb 1 looks UseResources' references up with the
+        /// lookup that raises for an empty entry, and its continuation too; a serial segment, a
+        /// type other than 1 or no 0xdb, with the nullable one.
+        #[test]
+        fn a_concurrent_pass_looks_resources_up_raising_empty() {
+            let dispatch_type = |ty: u32| {
+                rec(
+                    0xdb,
+                    CmdSetComputePassDescriptorDispatchType { dispatch_type: ty }.as_bytes(),
+                )
+            };
+            let uses = rec(
+                0x87,
+                &cat(&[
+                    CmdUseResources { count: 1, usage: 1 }.as_bytes(),
+                    &u32s(&[0]),
+                ]),
+            );
+            let mut t = setup();
+            let first = cat(&[&dispatch_type(1), &uses]);
+            t.d.decode(Hold::NONE, &seg(0, 1), cursor(first)).unwrap();
+            t.d.decode(Hold::NONE, &seg(1, 0), cursor(uses.clone()))
+                .unwrap();
+            assert_eq!(t.p.call_log().count("get_resource_raising_empty"), 2);
+            assert_eq!(t.p.call_log().count("get_resource"), 0);
+            for first in [
+                cat(&[&dispatch_type(0), &uses]),
+                cat(&[&dispatch_type(2), &uses]),
+                uses.clone(),
+            ] {
+                let mut t = setup();
+                t.d.decode(Hold::NONE, &seg(0, 0), cursor(first)).unwrap();
+                assert_eq!(t.p.call_log().count("get_resource"), 1);
+                assert_eq!(t.p.call_log().count("get_resource_raising_empty"), 0);
+            }
         }
 
         #[test]

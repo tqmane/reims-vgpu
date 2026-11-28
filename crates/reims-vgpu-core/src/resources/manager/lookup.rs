@@ -5,6 +5,14 @@
 //! [`RaiseKind::Lookup`](super::RaiseKind::Lookup). The untyped resource lookup answers nil
 //! instead, and the writable cursor lookup null.
 //!
+//! [`ManagerLookup::get_resource_raising_empty`] is the untyped lookup for the one list whose nil
+//! entry Metal ends the process at, a concurrent compute encoder's `useResources:count:usage:`
+//! (`interplay_decodewalk_26`): a reference whose entry is empty (type 0) raises there, as the
+//! typed getters do. A guest empties a task's entries when the process that owns it ends, without
+//! waiting for the execs that process queued, so an exec the host runs late names empty entries
+//! (`interplay_lifetime_emptied_resource`; the function resolver's exception, `resolver.rs`, is
+//! the same). Every other list keeps the nil, which Metal skips.
+//!
 //! Every getter is nullable: `Ok(None)` is nil (reference 0, or a Metal nil nothing checks),
 //! which flows on. The deserializer's `require_…` variants are its own nil checks over these
 //! getters. A lookup can create the object (lookup is creation), so the decoders call exactly
@@ -248,6 +256,30 @@ impl<P: Platform> ManagerLookup<P> {
             .live()
             .get_object_resource(hold, reference)?
             .unwrap_or_default())
+    }
+
+    /// [`Self::get_resource`], except that a reference whose entry is empty is logged and raised
+    /// as a typed getter's failure is; any other error is still nil.
+    pub fn get_resource_raising_empty(
+        &self,
+        hold: Hold<'_>,
+        reference: u32,
+    ) -> RaiseResult<Option<AnyResource<P>>> {
+        #[cfg(test)]
+        self.trace(
+            "get_resource_raising_empty",
+            crate::testkit::calllog::Arg::U32(reference),
+        );
+        let m = self.live();
+        let result = m.get_object_resource(hold, reference)?;
+        if result.is_err()
+            && m.get_object_entry(reference)
+                .is_ok_and(|entry| entry.object_type() == 0)
+        {
+            return self.answer(ObjectKind::Resource, result);
+        }
+        // Any other error is nil: no log, no raise
+        Ok(result.unwrap_or_default())
     }
 
     /// A new texture descriptor for a serialized one.
@@ -544,6 +576,39 @@ mod tests {
             // No handler: nothing is raised, so nothing dies.
             assert!(d.get_resource(Hold::NONE, 9).unwrap().is_none());
             assert!(d.get_resource(Hold::NONE, 0).unwrap().is_none());
+        }
+
+        /// An entry the guest emptied (type 0 and offset all ones, as a task's end leaves each of
+        /// its entries) is nil to the untyped lookup, and raises the resource lookup's failure,
+        /// with the failure's line, to the one that raises for it; any other error is nil to both.
+        #[test]
+        fn a_resource_whose_entry_is_empty_raises_only_where_asked() {
+            let fx = Fx::new(
+                &[(0, 0, 0), (6, 0x10, REC), (0, 0, u64::MAX)],
+                Placement::Off,
+            );
+            let d = fx.m.object_delegate();
+            let (nil, lines) = fx.logged(|| d.get_resource(Hold::NONE, 2).unwrap().is_none());
+            assert!(nil);
+            assert!(lines.is_empty());
+            for reference in [0, 9] {
+                assert!(
+                    d.get_resource_raising_empty(Hold::NONE, reference)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let (r, lines) = fx.logged(|| d.get_resource_raising_empty(Hold::NONE, 2));
+            let r = r.err().unwrap();
+            assert_eq!(
+                r.id(),
+                RaiseId::Manager(RaiseKind::Lookup(ObjectKind::Resource))
+            );
+            assert_eq!(r.detail(), Some("resource lookup failed"));
+            assert_eq!(
+                lines,
+                vec!["resource lookup failed: object 2 has an empty entry"]
+            );
         }
     }
 
